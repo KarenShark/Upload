@@ -1,0 +1,64 @@
+awesome — here’s a tight, 2-slide English deck you can paste straight into PowerPoint/Keynote.
+
+⸻
+
+Slide 1 — From Pain Point → MVP (What/Why/Who/Value)
+
+Today (Status Quo)
+	•	High volume of NPS comments/complaints must be mapped to fixed taxonomy (Channel → Major → Minor).
+	•	Mostly manual reading + clicking → slow, subjective, hard to audit.
+
+Problems
+	•	Efficiency: 2–4 min per record; backlogs during peaks.
+	•	Consistency: different people/times = shifting interpretations.
+	•	Accuracy: multi-issue/borderline texts get mis- or under-tagged.
+	•	Traceability: hard to explain “why this label.”
+	•	Opportunity cost: analysts spend time tagging instead of analysis.
+
+MVP (Controlled Automation)
+	•	Internal LLM (gpt-4o base) + strict system prompt.
+	•	Pick only from official taxonomy; JSON-only output.
+	•	Local validation (JSON schema + enum relations), auto repair retry if invalid.
+	•	Human-in-the-loop for low confidence (e.g., <0.6).
+	•	PII masking, auditable logs (model/prompt/version/request ID).
+
+Beneficiaries & Reach
+	•	NPS/VoC, Complaints, Service Quality.
+	•	Any rule-based, repetitive mapping (ticket routing, CS topics, feedback labels…).
+
+Value (Time & Quality)
+	•	Template: Weekly time ≈ N * t_manual → becomes N*p_auto*t_auto + N*(1−p_auto)*t_review.
+	•	Example: N=1000, t_manual=3m, p_auto=75%, t_auto=0.2m, t_review=2m
+→ Manual 50h vs Automated 10.8h → ~78% time saved.
+	•	Plus: higher consistency, traceability, and faster SLA.
+
+⸻
+
+Slide 2 — How it Works → Rollout → Scale (Flow/Use/Ask/Extend)
+
+Flow (1 picture)
+	1.	Input Excel/CSV (id, comment[, complaint]) → mask PII
+	2.	Send to LLM (strict prompt + official taxonomy)
+	3.	Model returns JSON: channel/major/minor/confidence/rationale/signals
+	4.	Local validation (JSON + enum checks) → auto repair retry if needed
+	5.	Output mapped.csv; low-confidence list → human review
+	6.	Sync to dashboards/data warehouse; full audit trail
+
+How People Use It
+	•	Batch or scheduled run; dashboards read the latest mapped.csv.
+	•	Reviewers only handle low-confidence items; corrections can be written back.
+
+Rollout Plan
+	•	Pilot (2–3 weeks): 1–2 lines of business, last 1–2 weeks’ data.
+	•	Targets: Major ≥ 90%, Minor ≥ 85%, Straight-through rate ≥ 70% (tuneable).
+	•	Go-Live: add scheduling/integration; monitor failures, straight-through, hours saved, error feedback loop.
+
+What We Need (Ask)
+	•	Taxonomy owner (govern and version the official list).
+	•	Gold set for alignment and evaluation.
+	•	Integration point (warehouse/scheduler/SharePoint).
+	•	Compliance sign-off (masking, logs, access).
+
+Extendibility (Beyond NPS)
+	•	Ticket auto-routing, CS topic grouping, product feedback labeling, compliance keyword pre-screen/escalation.
+	•	Pluggable pattern: swap in a different taxonomy, reuse the same controlled-automation pipeline—foundation for broader process automation.
