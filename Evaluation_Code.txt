@@ -1,179 +1,185 @@
+# -*- coding: utf-8 -*-
+# ===== Sanity checks for diversity potential & benefit (print-only) =====
 import pandas as pd
 import numpy as np
+from pathlib import Path
 
-# ========= 读取你已有的数据 =========
-wide = pd.read_csv('output/3_REWARD_180925_customer_level_top3.csv', parse_dates=['VERSION_DATE'])
-df_in = pd.read_csv('data/model_input_prep_for_training.csv', parse_dates=['VERSION_DATE'])
+# ---- 读取结果：若内存中已有 res，就用它；否则从 CSV 读取 ----
+try:
+    _ = res  # noqa
+    df = res.copy()
+except NameError:
+    model_name = "3_REWARD_180925"  # ← 若不同，请改成你的模型名
+    path = Path(f"output/{model_name}_customer_level_diversity_eval.csv")
+    df = pd.read_csv(path, parse_dates=["VERSION_DATE"]) if path.exists() else None
+    if df is None:
+        raise FileNotFoundError(f"Cannot find file: {path}")
 
-# ========= 一些健壮性处理 =========
-wide['CUST_SERIAL_NO'] = wide['CUST_SERIAL_NO'].astype(str)
-df_in['CUST_SERIAL_NO'] = df_in['CUST_SERIAL_NO'].astype(str)
+# ---- 轻量清洗 ----
+if "VERSION_DATE" in df.columns and not np.issubdtype(df["VERSION_DATE"].dtype, np.datetime64):
+    # 若不是日期，就尽量解析
+    try:
+        df["VERSION_DATE"] = pd.to_datetime(df["VERSION_DATE"])
+    except Exception:
+        pass
 
-# 选 segment 列（如果没有 CEM_SEGMENT 就用 'global'）
-SEG_COL = 'CEM_SEGMENT' if 'CEM_SEGMENT' in df_in.columns else None
-if SEG_COL is None:
-    df_in['segment'] = 'global'
+for col in ["benefit", "readiness", "benefit_norm", "diversity_score"]:
+    if col not in df.columns:
+        raise KeyError(f"Missing column `{col}` in the evaluation dataframe.")
+
+N = len(df)
+div_mask = df["benefit"].fillna(0) > 0
+n_div = int(div_mask.sum())
+share_div = n_div / N if N > 0 else 0.0
+
+def _summ(series):
+    s = pd.Series(series).dropna()
+    if s.empty:
+        return {"count": 0}
+    q = s.quantile([.1,.25,.5,.75,.9,.95,.99])
+    return {
+        "count": int(s.size),
+        "mean": float(s.mean()),
+        "std": float(s.std(ddof=0)) if s.size > 1 else 0.0,
+        "min": float(s.min()),
+        "p10": float(q.loc[.1]),
+        "p25": float(q.loc[.25]),
+        "p50": float(q.loc[.5]),
+        "p75": float(q.loc[.75]),
+        "p90": float(q.loc[.9]),
+        "p95": float(q.loc[.95]),
+        "p99": float(q.loc[.99]),
+        "max": float(s.max()),
+    }
+
+print("\n================ OVERALL =================")
+print(f"Rows: {N:,}")
+print(f"Customers worth diversifying (benefit>0): {n_div:,}  ({share_div:,.2%})")
+
+b_all   = _summ(df["benefit"])
+b_pos   = _summ(df.loc[div_mask, "benefit"])
+score_s = _summ(df["diversity_score"])
+ready_s = _summ(df["readiness"])
+
+def _pretty(d, title):
+    if "count" not in d: 
+        print(f"{title}: N/A"); 
+        return
+    print(f"\n{title}")
+    keys = ["count","mean","std","min","p10","p25","p50","p75","p90","p95","p99","max"]
+    for k in keys:
+        if k in d:
+            val = d[k]
+            if isinstance(val, (int, np.integer)):
+                print(f"  {k:>4}: {val:,}")
+            else:
+                print(f"  {k:>4}: {val:,.4f}")
+
+_pretty(b_all,   "Benefit (all rows)")
+_pretty(b_pos,   "Benefit (only benefit>0)")
+_pretty(score_s, "Diversity score (0-1)")
+_pretty(ready_s, "Readiness (0-1)")
+
+# ---- 1) 每月对比：mean(benefit) / mean(diversity_score) / share(benefit>0) ----
+if "VERSION_DATE" in df.columns:
+    month = df["VERSION_DATE"]
+    try:
+        # 若为日期，按月 period；否则直接用原值
+        month = df["VERSION_DATE"].dt.to_period("M").astype(str)
+    except Exception:
+        month = df["VERSION_DATE"].astype(str)
+
+    monthly = (
+        df.assign(month=month)
+          .groupby("month")
+          .agg(
+              rows=("benefit","size"),
+              mean_benefit=("benefit","mean"),
+              median_benefit=("benefit","median"),
+              mean_diversity_score=("diversity_score","mean"),
+              mean_readiness=("readiness","mean"),
+              share_diversified=("benefit", lambda s: (s>0).mean()),
+          )
+          .reset_index()
+          .sort_values("month")
+    )
+    print("\n================ BY MONTH ================")
+    print(monthly.to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
 else:
-    df_in['segment'] = df_in[SEG_COL].astype(str).fillna('unknown')
+    print("\n[BY MONTH] `VERSION_DATE` not found; skipped.")
 
-# ========= 标准化产品名，确保 SELLING_FINAL 与 Top-K 名称能对齐 =========
-def norm_prod_name(x):
-    if pd.isna(x):
-        return np.nan
-    s = str(x).strip().lower()
-    s = s.replace(' ', '_').replace('-', '_').replace('/', '_')
-    # 可按你们的命名习惯做对齐（示例：去掉重复前缀等）
-    return s
+# ---- 2) 被“替换”为何产品最多（只看 benefit>0 的行） ----
+print("\n============ PRODUCT REPLACEMENTS ==========")
+prod_base_col = "baseline_prod" if "baseline_prod" in df.columns else \
+                ("rec1_candidate_product" if "rec1_candidate_product" in df.columns else None)
+prod_alt_col  = "best_div_prod" if "best_div_prod" in df.columns else None
 
-# 在训练数据中构建标准化产品名
-if 'SELLING_FINAL' in df_in.columns:
-    df_in['prod_name'] = df_in['SELLING_FINAL'].apply(norm_prod_name)
+if prod_base_col and prod_alt_col:
+    rep = (
+        df.loc[div_mask, [prod_base_col, prod_alt_col]]
+          .groupby([prod_base_col, prod_alt_col])
+          .size().reset_index(name="count")
+          .sort_values("count", ascending=False)
+    )
+    print("\nTop replacement flows (baseline -> best_alt):")
+    print(rep.head(15).to_string(index=False))
+
+    # 各 baseline 的“被替换率”
+    base_total = df.groupby(prod_base_col)["benefit"].size()
+    base_repl  = df.loc[div_mask].groupby(prod_base_col)["benefit"].size()
+    repl_rate  = (base_repl / base_total).fillna(0).reset_index(name="replacement_rate") \
+                .sort_values("replacement_rate", ascending=False)
+    print("\nReplacement rate by baseline product:")
+    print(repl_rate.to_string(index=False, float_format=lambda x: f"{x:,.2%}"))
 else:
-    # 如果没有 SELLING_FINAL，就用 PRODUCT_ID 字符串占位
-    df_in['prod_name'] = 'p_' + df_in['PRODUCT_ID'].astype(str)
+    print("Product columns not found; skipped product-level analysis.")
 
-# 将 wide 的 Top-K 名称标准化到同一空间
-rec_name_cols = []
-for k in (1,2,3):
-    c = f"rec{k}_candidate_product" if f"rec{k}_candidate_product" in wide.columns else f"rec{k}_product"
-    rec_name_cols.append(c)
-    wide[c] = wide[c].apply(norm_prod_name)
+# ---- 3) 分 segment（若有相关列） ----
+print("\n================ BY SEGMENT ===============")
+seg_candidates = ["CEM_SEGMENT","SEGMENT","segment","IND_DES2","SEG_DIV"]
+seg_col = next((c for c in seg_candidates if c in df.columns), None)
+if seg_col:
+    seg_tbl = (
+        df.groupby(seg_col)
+          .agg(
+              rows=("benefit","size"),
+              share_diversified=("benefit", lambda s: (s>0).mean()),
+              mean_benefit=("benefit","mean"),
+              mean_diversity_score=("diversity_score","mean")
+          ).reset_index()
+          .sort_values("mean_diversity_score", ascending=False)
+    )
+    print(f"\nSegment summary by `{seg_col}` (top 15 by mean_diversity_score):")
+    print(seg_tbl.head(15).to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
+else:
+    print("No segment column found; skipped segment analysis.")
 
-# ========= 构建参考表：训练期（<= 2024-09-30）接受后的平均收益 =========
-train_cut = pd.Timestamp('2024-09-30')
-df_train = df_in[df_in['VERSION_DATE'] <= train_cut].copy()
+# ---- 4) 与 engagement 的关系（若有 rec1 的 engagement 概率） ----
+print("\n============= ENGAGEMENT RELATION ==========")
+eng_candidates = ["rec1_eng_proba","eng_p1","engagement_proba","top1_engagement_proba","p1_eng"]
+eng_col = next((c for c in eng_candidates if c in df.columns), None)
 
-# 接受标记：若没有明确 0/1，可以用 >0 作为接受的近似
-acc_col = 'OVERALL_TRIGGER_RESPONSE' if 'OVERALL_TRIGGER_RESPONSE' in df_train.columns else None
-rev_col = 'TOTAL_REVENUE' if 'TOTAL_REVENUE' in df_train.columns else None
-assert acc_col is not None and rev_col is not None, "训练数据缺少 OVERALL_TRIGGER_RESPONSE 或 TOTAL_REVENUE"
-
-df_train['accepted'] = (df_train[acc_col].fillna(0) > 0).astype(int)
-df_train['revenue']  = pd.to_numeric(df_train[rev_col], errors='coerce').fillna(0.0)
-
-# winsorize 收入（提高稳健性）
-low, high = np.nanpercentile(df_train['revenue'], [1, 99])
-df_train['rev_w'] = df_train['revenue'].clip(lower=low, upper=high)
-
-# 分组统计：segment × prod_name
-grp = df_train.groupby(['segment','prod_name'])
-ref_seg_prod = grp.agg(
-    n=('accepted','size'),
-    n_acc=('accepted','sum'),
-    p_acc=('accepted','mean'),
-    e_rev_accepted=('rev_w', lambda s: s[df_train.loc[s.index, 'accepted'] == 1].mean())
-).reset_index()
-
-# 产品全局回退：prod_name（忽略 segment）
-grp2 = df_train.groupby('prod_name')
-ref_prod = grp2.agg(
-    n=('accepted','size'),
-    n_acc=('accepted','sum'),
-    p_acc=('accepted','mean'),
-    e_rev_accepted=('rev_w', lambda s: s[df_train.loc[s.index, 'accepted'] == 1].mean())
-).reset_index()
-
-# 频数太小的分组，回退到产品全局均值
-MIN_N = 50
-ref_seg_prod = ref_seg_prod.merge(ref_prod[['prod_name','e_rev_accepted']]
-                                  .rename(columns={'e_rev_accepted':'e_rev_accepted_prod'}),
-                                  on='prod_name', how='left')
-ref_seg_prod['e_rev_accepted_final'] = np.where(
-    ref_seg_prod['n'] >= MIN_N,
-    ref_seg_prod['e_rev_accepted'],
-    ref_seg_prod['e_rev_accepted_prod']
-)
-# 若仍为空，回退 0
-ref_seg_prod['e_rev_accepted_final'] = ref_seg_prod['e_rev_accepted_final'].fillna(0.0)
-
-# ========= 给 wide 合并 segment =========
-# 用同月的客户画像取代表值（若 wide 没这些列）
-base_keys = ['VERSION_DATE','CUST_SERIAL_NO','segment']
-seg_first = (df_in[['VERSION_DATE','CUST_SERIAL_NO','segment']]
-             .drop_duplicates(subset=['VERSION_DATE','CUST_SERIAL_NO'], keep='first'))
-wide = wide.merge(seg_first, on=['VERSION_DATE','CUST_SERIAL_NO'], how='left')
-wide['segment'] = wide['segment'].fillna('global')
-
-# ========= 处理 Top-K 概率（若没有 *_eng_proba，用 score 做分位数缩放占位）=========
-for k in (1,2,3):
-    pcol = f"rec{k}_eng_proba"
-    scol = f"rec{k}_score"
-    if pcol not in wide.columns:
-        if scol in wide.columns:
-            s = wide[scol].copy()
-            lo, hi = np.nanpercentile(s, [1,99])
-            wide[pcol] = np.clip((s - lo) / (hi - lo + 1e-8), 0, 1)
-        else:
-            wide[pcol] = np.nan  # 实在没有就置空（会被当作不可用）
-
-# ========= 计算 per-customer 的 baseline / diversified / benefit / readiness =========
-def get_e_rev(seg, prod_name):
-    row = ref_seg_prod[(ref_seg_prod['segment']==seg) & (ref_seg_prod['prod_name']==prod_name)]
-    if not row.empty:
-        return float(row['e_rev_accepted_final'].iloc[0])
-    # 回退到产品全局
-    row2 = ref_prod[ref_prod['prod_name']==prod_name]
-    if not row2.empty:
-        v = row2['e_rev_accepted'].iloc[0]
-        return float(0.0 if pd.isna(v) else v)
-    return 0.0
-
-def row_metrics(r):
-    seg = r.get('segment', 'global')
-    recs = []
-    for k in (1,2,3):
-        pcol = f"rec{k}_eng_proba"
-        # 名称列
-        ncol = f"rec{k}_candidate_product" if f"rec{k}_candidate_product" in r.index else f"rec{k}_product"
-        prod = r.get(ncol, np.nan)
-        pacc = r.get(pcol, np.nan)
-        if pd.notna(prod) and pd.notna(pacc):
-            er = get_e_rev(seg, prod)
-            recs.append((k, prod, float(pacc), float(er)))
-
-    if not recs:
-        return pd.Series({'baseline_prod': np.nan, 'baseline_er': 0.0,
-                          'best_div_prod': np.nan, 'alt_best_er': 0.0,
-                          'benefit': 0.0, 'readiness': 0.0, 'diversity_score': 0.0})
-
-    # baseline = rec1
-    _, prod1, p1, e1 = recs[0]
-    base = p1 * e1
-
-    # 最佳多元化候选（rec2/rec3）
-    best_er, best_prod = base, prod1
-    for (k, prod, p, e) in recs[1:]:
-        cand = p * e
-        if cand > best_er:
-            best_er, best_prod = cand, prod
-
-    benefit = max(0.0, best_er - base)
-
-    # 简版 readiness： (1 - margin) + 熵（0~1）
-    pvals = np.array([x[2] for x in recs], dtype=float)
-    pvals = pvals / (pvals.sum() + 1e-12)
-    entropy = -np.sum(pvals * np.log(pvals + 1e-12)) / np.log(len(pvals))  # 归一化熵
-    margin  = recs[0][2] - (recs[1][2] if len(recs) > 1 else 0.0)
-    readiness = 1 / (1 + np.exp(-( (1 - margin) + 0.5*entropy )))  # 权重可调
-
-    return pd.Series({
-        'baseline_prod': prod1, 'baseline_er': base,
-        'best_div_prod': best_prod, 'alt_best_er': best_er,
-        'benefit': benefit, 'readiness': readiness
-    })
-
-out = wide.apply(row_metrics, axis=1)
-res = pd.concat([wide[['VERSION_DATE','CUST_SERIAL_NO'] + rec_name_cols], out], axis=1)
-
-# benefit 归一化（0~1）后与 readiness 合成 diversity_score
-q1, q99 = np.nanpercentile(res['benefit'], [1,99])
-res['benefit_norm'] = np.clip((res['benefit'] - q1) / (q99 - q1 + 1e-8), 0, 1)
-res['diversity_score'] = res['benefit_norm'] * res['readiness']
-
-# 结果预览与落盘
-print(res.head())
-print("Avg benefit:", round(res['benefit'].mean(), 4))
-print("Avg diversity_score:", round(res['diversity_score'].mean(), 4))
-
-res.to_csv('output/3_REWARD_180925_customer_level_diversity_eval.csv', index=False)
-print("Saved:", 'output/3_REWARD_180925_customer_level_diversity_eval.csv')
+if eng_col:
+    # 分位分箱（避免重复边界导致报错）
+    try:
+        bins = pd.qcut(df[eng_col], q=10, duplicates="drop")
+    except Exception:
+        # 若值过少/常量，用等宽分箱
+        bins = pd.cut(df[eng_col], bins=10, include_lowest=True)
+    rel = (
+        df.assign(eng_bin=bins)
+          .groupby("eng_bin")
+          .agg(
+              rows=("benefit","size"),
+              mean_eng=(eng_col,"mean"),
+              share_diversified=("benefit", lambda s: (s>0).mean()),
+              mean_benefit=("benefit","mean"),
+              mean_diversity_score=("diversity_score","mean"),
+          )
+          .reset_index()
+          .sort_values("mean_eng")
+    )
+    print(f"\nRelationship vs engagement `{eng_col}` (binned):")
+    print(rel.to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
+else:
+    print("No engagement-probability column found; skipped engagement relationship.")
