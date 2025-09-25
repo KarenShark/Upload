@@ -1,47 +1,89 @@
-# 数据摘要打印：customer-date 去重、唯一个客数等
-# 注：print 输出为英文；注释为中文
-
 import pandas as pd
+import numpy as np
 
-# 若 pred 尚未加载，请取消下一行注释并确保 pred_path 指向你的预测 CSV
-# pred = pd.read_csv(pred_path, parse_dates=['VERSION_DATE'])
+# === 读数据 ===
+wide = pd.read_csv('output/3_REWARD_180925_customer_level_top3.csv', parse_dates=['VERSION_DATE'])
+seg  = pd.read_csv('output/customer_segment_map.csv')              # CUST_SERIAL_NO, segment
+ref  = pd.read_csv('output/ref_segment_product_stats.csv')         # segment, product, e_rev_accepted
 
-# 统一数据类型（稳妥起见）
-pred['CUST_SERIAL_NO'] = pred['CUST_SERIAL_NO'].astype(str)
-pred['VERSION_DATE'] = pd.to_datetime(pred['VERSION_DATE'])
+# 合并 segment
+wide = wide.merge(seg, on='CUST_SERIAL_NO', how='left')
 
-# 1) 原始行数（campaign-level）
-raw_rows = len(pred)
+# —— 如果你目前没有 *_eng_proba 列，用 score 先做一个归一化占位（务必尽快换成“已校准概率”）——
+for k in (1,2,3):
+    if f"rec{k}_eng_proba" not in wide.columns:
+        # min-max 到 [0,1]；实际请替换为校准后的概率
+        s = wide.get(f"rec{k}_score")
+        if s is not None:
+            s = (s - np.nanpercentile(s, 1)) / (np.nanpercentile(s, 99) - np.nanpercentile(s, 1) + 1e-8)
+            wide[f"rec{k}_eng_proba"] = np.clip(s, 0, 1)
 
-# 2) 每月的 unique customer 数（即 customer-date 对的月度分布）
-by_month = pred.groupby('VERSION_DATE')['CUST_SERIAL_NO'].nunique().sort_index()
+# 取参考 e_rev（接受后平均收入），并做简单回退
+def get_e_rev(seg, prod):
+    row = ref[(ref['segment']==seg) & (ref['product']==prod)]
+    if not row.empty:
+        return float(row['e_rev_accepted'].iloc[0])
+    row2 = ref[ref['product']==prod]
+    if not row2.empty:
+        return float(row2['e_rev_accepted'].mean())
+    return 0.0
 
-# 3) customer-date 总数（= 在三个月内去重后的 (VERSION_DATE, CUST_SERIAL_NO) 对数）
-unique_pairs_drop = pred.drop_duplicates(['VERSION_DATE', 'CUST_SERIAL_NO']).shape[0]
+def row_metrics(r):
+    seg = r.get('segment', 'global')
 
-# 也可用分月求和（做个一致性校验）
-unique_pairs_sum = int(by_month.sum())
+    # 读取 Top-K
+    recs = []
+    for k in (1,2,3):
+        pcol = f"rec{k}_candidate_product" if f"rec{k}_candidate_product" in r.index else f"rec{k}_product"
+        pacol= f"rec{k}_eng_proba"
+        if pd.notna(r.get(pcol, np.nan)) and pd.notna(r.get(pacol, np.nan)):
+            prod = r[pcol]
+            pacc = float(r[pacol])
+            er   = get_e_rev(seg, prod)
+            recs.append((k, prod, pacc, er))
 
-# 4) 三个月合并后的唯一个客数（仅按 CUST_SERIAL_NO 去重）
-unique_customers = pred['CUST_SERIAL_NO'].nunique()
+    if not recs:
+        return pd.Series({'baseline_prod': np.nan, 'baseline_er': 0.0,
+                          'best_div_prod': np.nan, 'alt_best_er': 0.0,
+                          'benefit': 0.0, 'readiness': 0.0, 'diversity_score': 0.0})
 
-# 5) 每位客户平均出现的月份数（辅助理解）
-avg_months_per_customer = unique_pairs_drop / unique_customers if unique_customers else float('nan')
+    # Baseline = rec1
+    _, prod1, p1, e1 = recs[0]
+    base = p1 * e1
 
-# ---- 打印结果（英文）----
-print("=== Offline Evaluation Summary (3-month window) ===")
-print(f"Raw rows (campaign-level): {raw_rows:,}")
+    # 最佳多元化候选（rec2/3）
+    best_er, best_prod = base, prod1
+    for (k, prod, p, e) in recs[1:]:
+        cand = p * e
+        if cand > best_er:
+            best_er, best_prod = cand, prod
 
-print("\n# Unique customer-date pairs by month:")
-for d, n in by_month.items():
-    # 显示为 YYYY-MM-DD 以与你的数据一致
-    print(f"  {d.date()}: {int(n):,}")
+    benefit = max(0.0, best_er - base)
 
-print(f"\nTotal unique customer-date pairs (drop-duplicates): {unique_pairs_drop:,}")
-print(f"Total unique customer-date pairs (sum of monthly): {unique_pairs_sum:,}")
+    # readiness（简版）：(1 - margin) + 熵
+    pvals = [x[2] for x in recs]
+    pvals = np.array(pvals) / (np.sum(pvals) + 1e-12)
+    entropy = -np.sum(pvals * np.log(pvals + 1e-12)) / np.log(len(pvals))  # 0~1
+    margin  = recs[0][2] - (recs[1][2] if len(recs) > 1 else 0.0)
+    readiness = 1/(1+np.exp(-( (1 - margin) + 0.5*entropy )))  # 可调权重
 
-# 一致性检查提示（非报错，仅提示）
-print(f"Consistency check (pairs equal by both methods): {unique_pairs_drop == unique_pairs_sum}")
+    # diversity score（合成）
+    # 将 benefit 做鲁棒缩放（分位数到 0~1）
+    # —— 建议在聚合后整体缩放；这里先返回原值
+    return pd.Series({
+        'baseline_prod': prod1, 'baseline_er': base,
+        'best_div_prod': best_prod, 'alt_best_er': best_er,
+        'benefit': benefit, 'readiness': readiness
+    })
 
-print(f"\nUnique customers across 3 months: {unique_customers:,}")
-print(f"Avg months per customer (pairs/customers): {avg_months_per_customer:.2f}")
+out = wide.apply(row_metrics, axis=1)
+res = pd.concat([wide[['VERSION_DATE','CUST_SERIAL_NO']], out], axis=1)
+
+# 把 benefit 0~1 归一化，再与 readiness 合成 diversity_score
+q1, q99 = np.nanpercentile(res['benefit'], [1,99])
+res['benefit_norm'] = np.clip((res['benefit']-q1)/(q99-q1+1e-8), 0, 1)
+res['diversity_score'] = res['benefit_norm'] * res['readiness']
+
+print(res.head())
+print("Avg benefit:", res['benefit'].mean())
+print("Top-quantile (95%) avg benefit:", res.loc[res['diversity_score']>=res['diversity_score'].quantile(0.95),'benefit'].mean())
