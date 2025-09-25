@@ -1,212 +1,130 @@
-下面给你三块可直接粘到 notebook 的代码（全部自带健壮性检查与英文打印）。我统一假设你已经把上一节保存好的评估表读成了 eval_df（或你也可以用第一段里给的 read_csv 直接载入）。
+下面这段是可直接贴进 Jupyter 的 Markdown（含公式）的说明稿。它把我们现在的做法系统化为“Diversity Potential × Diversity Benefit”两部分，并给出可解释的定义、计算与落地建议。
 
 ⸻
 
-1) 设运营阈值，计算 share_diversified（并做阈值灵敏度）
+Defining and Measuring “Diversity” for NBA Recommendations
 
-# === Load (若你已有 eval_df 可跳过这三行) ===
-import pandas as pd, numpy as np
-from pathlib import Path
+Why we care
 
-model_name = "3_REWARD_180925"
-eval_path  = Path(f"output/{model_name}_customer_level_diversity_eval.csv")
-eval_df    = pd.read_csv(eval_path, parse_dates=['VERSION_DATE'])
+“Diversity” 不只是让用户收到更多元的产品，更关键是在不牺牲转化/价值的前提下，把合适的客户引导到更匹配的备选产品，从而带来可量化的增益（benefit）。因此我们的评估聚焦于两件事：
+	1.	这个客户现在是否适合被多元化（diversify-ready？）
+	2.	若实施多元化，相对不多元化能带来多少收益（diversity benefit？）
 
-# 基本检查
-need_cols = ['VERSION_DATE','CUST_SERIAL_NO','readiness','benefit','diversity_score',
-             'baseline_prod','best_div_prod']
-missing = [c for c in need_cols if c not in eval_df.columns]
-assert not missing, f"Missing columns in eval_df: {missing}"
-
-# 统一月份列
-eval_df['month'] = eval_df['VERSION_DATE'].dt.to_period('M').astype(str)
-
-def threshold_sweep(df, readiness_thr=0.8, quantiles=(0.50, 0.75, 0.90), label_prefix="Q"):
-    """按若干 benefit 分位数阈值 + readiness 阈值，统计 share、uplift 等"""
-    pos = df['benefit'] > 0
-    qmap = df.loc[pos, 'benefit'].quantile(list(quantiles)).to_dict() if pos.any() else {}
-    rows = []
-
-    # 也加一个绝对阈值 0（只要收益>0 且 readiness 达标就多元化）
-    qmap = {**{f"{label_prefix}{int(q*100)}": thr for q, thr in qmap.items()},
-            "ABS>0": 0.0}
-
-    for name, thr in qmap.items():
-        mask = (df['readiness'] >= readiness_thr) & (df['benefit'] >= thr)
-        share = mask.mean()
-        cnt   = int(mask.sum())
-        rows_total = len(df)
-        mean_benefit_div = df.loc[mask, 'benefit'].mean() if cnt>0 else 0.0
-        total_uplift     = df.loc[mask, 'benefit'].sum()
-        mean_divscore    = df.loc[mask, 'diversity_score'].mean() if cnt>0 else 0.0
-
-        # 分月
-        by_m = (df.assign(_flag=mask)
-                  .groupby('month')
-                  .agg(rows=('CUST_SERIAL_NO','size'),
-                       share_diversified=('_flag','mean'),
-                       mean_benefit=('benefit', lambda x: x[mask.loc[x.index]].mean() if x.index.size else np.nan))
-                  .reset_index())
-
-        print(f"\n=== Threshold: readiness≥{readiness_thr}, benefit≥{name} (={thr:.2f}) ===")
-        print(f"rows: {rows_total:,} | diversified_cnt: {cnt:,} | share_diversified: {share:.3f}")
-        print(f"mean_benefit_if_diversified: {mean_benefit_div:.2f} | total_uplift: {total_uplift:,.2f} | mean_diversity_score: {mean_divscore:.3f}")
-        print("\nBy month:")
-        print(by_m.to_string(index=False))
-
-        rows.append({
-            'benefit_thr_name': name,
-            'benefit_thr': thr,
-            'readiness_thr': readiness_thr,
-            'rows': rows_total,
-            'div_cnt': cnt,
-            'share_diversified': share,
-            'mean_benefit_div': mean_benefit_div,
-            'total_uplift': total_uplift,
-            'mean_diversity_score': mean_divscore
-        })
-
-    return pd.DataFrame(rows).sort_values('benefit_thr')
-
-# 跑一版：readiness≥0.8，benefit 取 {p50, p75, p90, >0}
-summary_tbl = threshold_sweep(eval_df, readiness_thr=0.8, quantiles=(0.5, 0.75, 0.9))
-print("\n=== Threshold sensitivity summary ===")
-print(summary_tbl.to_string(index=False))
-
-解释：
-	•	你会同时得到总体 share / uplift 以及分月对比，便于运营定阈值（例如选 readiness≥0.8 & benefit≥Q75）。
-	•	最下方 summary_tbl 汇总了各阈值组合下的覆盖率与收益，可直接导出作决策表。
+我们在**客户层（customer-level）**进行评估：每个 VERSION_DATE × CUST_SERIAL_NO 一行，先在该行内部选定 baseline 与 best alternative，再计算潜力与收益。
 
 ⸻
 
-2) 画“产品替换矩阵”热力图（baseline → best_alt）
-
-import matplotlib.pyplot as plt
-import numpy as np
-
-# 选择一个阈值组合来“定义多元化”
-READINESS_THR = 0.8
-# 选用上一步算出来的 p75；如未跑上一步，可换成常数例如 500
-benefit_thr = summary_tbl.loc[summary_tbl['benefit_thr_name']=="Q75",'benefit_thr'].max() \
-              if 'summary_tbl' in globals() else 500.0
-
-div_mask = (eval_df['readiness'] >= READINESS_THR) & (eval_df['benefit'] >= benefit_thr)
-
-# 生成替换计数表
-flows = (eval_df.loc[div_mask, ['baseline_prod','best_div_prod']]
-                  .groupby(['baseline_prod','best_div_prod'])
-                  .size()
-                  .unstack(fill_value=0))
-
-# 行列按总量排序
-flows = flows.loc[flows.sum(1).sort_values(ascending=False).index,
-                  flows.sum(0).sort_values(ascending=False).index]
-
-print("\nTop replacement flows (table):")
-print(flows.head(20).to_string())
-
-# 画热力图（matplotlib）
-fig, ax = plt.subplots(figsize=(8,6))
-im = ax.imshow(flows.values, aspect='auto')
-ax.set_xticks(np.arange(flows.shape[1])); ax.set_xticklabels(flows.columns, rotation=45, ha='right')
-ax.set_yticks(np.arange(flows.shape[0])); ax.set_yticklabels(flows.index)
-ax.set_title(f"Replacement heatmap (readiness≥{READINESS_THR}, benefit≥{benefit_thr:.0f})")
-fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="count")
-
-# 数字标注（可选）
-for i in range(flows.shape[0]):
-    for j in range(flows.shape[1]):
-        v = flows.values[i, j]
-        if v>0:
-            ax.text(j, i, str(v), ha='center', va='center', fontsize=8)
-
-plt.tight_layout()
-plt.show()
-
-解释：
-	•	这张热图非常适合跟业务讨论哪些 baseline 最常被替换成什么；行列已按总量排序，热点一眼能看出。
+Notation
+	•	i：客户；t：时间（按月 VERSION_DATE）
+	•	B_{it}：baseline product（模型当前最可能推荐/默认路径）
+	•	A_{it}：best alternative（在本期 Top-K 备选中、综合指标最优的那个）
+	•	p^{\text{eng}}_{it}(\cdot)：对某产品的参与/接受概率（engagement/acceptance prob）
+	•	v^{\text{rev}}_{it}(\cdot)：选择该产品带来的未来 H 期的预期价值（收入/利润）
+	•	E^{\text{rev}}{it}(\cdot) = p^{\text{eng}}{it}(\cdot)\times v^{\text{rev}}_{it}(\cdot)：期望收益
+	•	\Delta^{\text{rev}}{it} = E^{\text{rev}}{it}(A_{it}) - E^{\text{rev}}{it}(B{it})：diversity benefit（绝对）
+	•	\widehat{\Delta}^{\text{rev}}{\min}, \widehat{\Delta}^{\text{rev}}{\max}：在观测窗口内（例如 3 个月）对 \Delta^{\text{rev}} 的样本下/上界
+	•	\(\widetilde{\Delta}^{\text{rev}}_{it} = \text{clip\norm}(\Delta^{\text{rev}}{it}) \in [0,1]\)：归一化的 benefit
+	•	R_{it}\in[0,1]：diversity potential（readiness），刻画客户此时被多元化的“可行性/合适度”
+	•	D_{it}：diversity score（用于排序与阈值决策）
 
 ⸻
 
-3) 加入 segment 与 engagement_proba，再跑分群/相关性
+1) Diversity Potential（Readiness）
 
-import re
+Intuition
 
-# === 3.1 追加 segment（如文件存在） ===
-try:
-    seg_map = pd.read_csv('output/customer_segment_map.csv')  # 需包含: CUST_SERIAL_NO, segment
-    assert {'CUST_SERIAL_NO','segment'}.issubset(seg_map.columns)
-    seg_map['CUST_SERIAL_NO'] = seg_map['CUST_SERIAL_NO'].astype(eval_df['CUST_SERIAL_NO'].dtype)
-    eval_df = eval_df.merge(seg_map[['CUST_SERIAL_NO','segment']], on='CUST_SERIAL_NO', how='left')
-    print("Segment column merged.")
-except Exception as e:
-    print(f"Segment map not found or invalid, skip segment analysis. Detail: {e}")
+不是所有客户都应被多元化。例如：
+	•	账户/资质缺失时，很多产品不适用（Eligibility）；
+	•	客户当期对我行互动弱，贸然换产品风险大（Engagement）；
+	•	如果历史上已覆盖了多数品类，则边际多元化收益可能递减（Novelty / diminishing return）。
 
-# === 3.2 识别 engagement 概率列 ===
-def find_eng_col(df):
-    cand = [c for c in df.columns
-            if re.search(r'(rec1|top1).*eng(agement)?(_)?proba', c, flags=re.I) or c.lower()=='eng_p1']
-    return cand[0] if cand else None
+A practical construction
 
-eng_col = find_eng_col(eval_df)
-if eng_col is None:
-    # 兜底：若没有概率列，用 rec1_score 作为参与度 proxy
-    eng_col = 'rec1_score' if 'rec1_score' in eval_df.columns else None
+我们把 readiness 看作 0–1 的合成评分：
+R_{it} = \underbrace{r^{\text{elig}}{it}}{\text{适配/可用}}
+\times \underbrace{r^{\text{eng}}{it}}{\text{参与/接受意愿}}
+\times \underbrace{r^{\text{nov}}{it}}{\text{新颖/边际多样性}}
+	•	r^{\text{elig}}_{it}：基于规则（如无账户→先开户类；资质不符→置 0）。
+	•	r^{\text{eng}}_{it}：可用 rec1_engagement_proba 或其 proxy（如 rec1_score），并按 [0,1] 归一。
+	•	r^{\text{nov}}_{it}：可由客户的产品覆盖度、香农熵或“与历史持有/最近成交的差异度”构造，越新颖越高。
 
-if eng_col:
-    print(f"Using engagement column: {eng_col}")
-else:
-    print("No engagement column found; engagement relationship will be skipped.")
-
-# === 3.3 在选定运营阈值下，做分群/相关性 ===
-READINESS_THR = 0.8
-benefit_thr   = summary_tbl.loc[summary_tbl['benefit_thr_name']=="Q75",'benefit_thr'].max() \
-                if 'summary_tbl' in globals() else 500.0
-mask = (eval_df['readiness'] >= READINESS_THR) & (eval_df['benefit'] >= benefit_thr)
-eval_df = eval_df.assign(_diversified=mask)
-
-# --- 分 segment（若有） ---
-if 'segment' in eval_df.columns:
-    seg_view = (eval_df
-                .groupby('segment')
-                .agg(rows=('CUST_SERIAL_NO','size'),
-                     share_diversified=('_diversified','mean'),
-                     mean_benefit=('benefit','mean'),
-                     mean_diversity_score=('diversity_score','mean'))
-                .sort_values('share_diversified', ascending=False)
-                .reset_index())
-    print("\n=== Diversification by segment ===")
-    print(seg_view.to_string(index=False))
-else:
-    print("\nNo segment column; skipped segment breakdown.")
-
-# --- 与 engagement 的关系（若有） ---
-if eng_col:
-    # 分箱：10 等分
-    eval_df['_eng_bin'] = pd.qcut(eval_df[eng_col].rank(method='first'), q=10, labels=False)
-    eng_view = (eval_df
-                .groupby('_eng_bin')
-                .agg(rows=('CUST_SERIAL_NO','size'),
-                     mean_eng=(eng_col,'mean'),
-                     share_diversified=('_diversified','mean'),
-                     mean_benefit=('benefit','mean'),
-                     mean_readiness=('readiness','mean'))
-                .reset_index()
-                .sort_values('_eng_bin'))
-    print("\n=== Diversification vs. engagement deciles ===")
-    print(eng_view.to_string(index=False))
-else:
-    print("\nNo engagement-probability proxy found; skipped engagement relationship.")
-
-解释：
-	•	segment：输出每个客群的覆盖率/收益/多元化分值，帮助定位“多元化最有效”的客群。
-	•	engagement：按 10 分位画出参与度越高是否越适合多元化的证据（覆盖率/收益随分位上升应该更优）。
+若暂时缺少 \,r^{\text{nov}}\, 与 \,r^{\text{elig}}\,，可先用 R_{it}=\text{normalize}(r^{\text{eng}}_{it}) 作为一版 MVP，后续逐步补齐。
 
 ⸻
 
-小结你要怎么用
-	•	先跑 Section 1 拿到 summary_tbl，和业务一起选一个运营阈值（推荐 readiness≥0.8 & benefit≥Q75 作为起点）。
-	•	用 Section 2 的热图对齐“哪些替换路径合理/需要加规则”。
-	•	用 Section 3 的分 segment 与 engagement 结果，确认在哪些客群先落地，并验证“高参与度→更适合多元化”的假设。
+2) Diversity Benefit（Expected Uplift）
 
-需要把这些输出落盘（CSV/PNG）用于汇报，我也可以给你一键保存版本。
+Baseline vs. best alternative
+
+给定同一客户当期的 Top-K 备选，我们选出：
+	•	B_{it}：默认/当前最优（如 Top-1）
+	•	A_{it}：在约束（规则/资格）允许下、期望收益最高的备选
+
+用期望收益衡量差值：
+\Delta^{\text{rev}}{it} = \underbrace{p^{\text{eng}}{it}(A_{it})\,v^{\text{rev}}{it}(A{it})}_{\text{Alt. EV}}
+	•	\underbrace{p^{\text{eng}}{it}(B{it})\,v^{\text{rev}}{it}(B{it})}_{\text{Baseline EV}}
+	•	p^{\text{eng}}：可直接用模型的接受概率列（或 engagement 概率）
+	•	v^{\text{rev}}：使用 3 个月离线观测窗内的人均贡献（如 TOTAL_REVENUE 的分段均值）或产品-segment 参考值表（避免极端值）。
+	•	v 可按折现（或按月平均×3）得到一致的 H-month 口径。
+
+将 \Delta^{\text{rev}} 在样本范围内做线性归一，得到 \widetilde{\Delta}^{\text{rev}}_{it}\in[0,1]。
+
+⸻
+
+3) Diversity Score（for policy & ranking）
+
+我们用可解释又稳健的组合方式：
+D_{it} \;=\; R_{it} \times \widetilde{\Delta}^{\text{rev}}_{it}
+	•	乘法意味着“既要有潜力（ready）又要有收益（benefit）”。
+	•	也可采用 \min(R_{it},\widetilde{\Delta}^{\text{rev}}_{it})（更保守），或加权几何/调和平均。
+
+⸻
+
+4) Turning scores into decisions
+
+运营阈值（示例）：
+	•	触发多元化的判定：
+\text{diversify}{it} = \mathbf{1}\{\, R{it} \ge r_0 \,\wedge\, \Delta^{\text{rev}}_{it} \ge b_0 \,\}
+其中 r_0 可取 0.8，b_0 可用当前样本的 p75/p90 等。
+	•	覆盖率–收益权衡：做阈值灵敏度表（coverage, mean benefit, total uplift），与业务共同选择 (r_0,b_0)。
+	•	产品替换矩阵（baseline × best_alt）热力图 → 对齐可接受的替换路径并加规则（eligibility/频控/负面清单）。
+
+⸻
+
+5) Offline evaluation (customer-level)
+	•	去重口径：以 VERSION_DATE × CUST_SERIAL_NO 为唯一键；先按 VERSION_DATE 再按客户聚合 Top-K 候选并取全局 Top-K（避免 campaign-level 重复）。
+	•	核心输出：
+	•	readiness R、benefit \Delta^{\text{rev}}、diversity score D、baseline & best_alt。
+	•	Sanity checks：
+	1.	\Pr(\Delta^{\text{rev}}>0) 及分布（总体/分月）；
+	2.	分产品/segment 的替换规模与平均收益；
+	3.	readiness/engagement 分箱下的 share 与 uplift 是否单调更优；
+	4.	与时间的稳定性（3 个月窗口各月的均值变化）。
+	•	对比策略：
+	•	No-diversity：全走 baseline；
+	•	Diversity policy：按阈值触发改荐 A。
+评估窗口内，用 expected uplift 总和 比较两策略的潜在价值差。
+
+⸻
+
+6) Interpretability & governance
+	•	“为什么替换？”：展示该客户 R_{it}、\Delta^{\text{rev}}_{it} 的构成（资格、参与、参考价值来源），以及对应的产品替换路径。
+	•	“换给谁？”：热力图与 segment 颗粒的收益排行，明确“在哪些客群/哪些 baseline”最值得先做。
+	•	“多样但不失控”：加入资格规则、频控（短期内不重复同品类）、客户约束（如高风险排除），保障体验与合规。
+
+⸻
+
+7) Extensions
+	•	Risk-adjusted benefit：用置信区间或方差做惩罚（更稳健）。
+	•	Long-term value：把 v^{\text{rev}} 扩展到 H>3 期并做折现；或引入留存/交叉购买的二阶效应。
+	•	Exploration credit：对新产品/冷启动客群给予小幅保守加成，提升学习效率。
+	•	Fairness & quota：对品类/客群设上下限，保证宏观分布均衡（可与业务 KPI 绑定）。
+
+⸻
+
+Takeaways
+	•	Diversity potential（是否适合）：让我们只在“客户当期合适”的前提下多元化。
+	•	Diversity benefit（值不值得）：确保每次多元化都有可计量的收益依据。
+	•	Diversity score：把两者合一，既可排序又可立规则，便于运营落地与 A/B 验证。
+
+这套定义与实现路径透明、可解释、可度量，能直接用于离线评估 → 阈值选择 → 线上策略的闭环。
