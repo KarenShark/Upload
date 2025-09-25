@@ -1,0 +1,195 @@
+太棒了！你把 3 份关键文件都准备好了。下面给你可直接复制运行的 4 组小脚本，分别用于快速体检这几个数据源，并把“按 VERSION_DATE→CUST_SERIAL_NO 去重取 Top-K”的结构先跑顺。
+
+所有代码都只做读取与打印，不会改动文件。
+
+⸻
+
+0) 通用导入与一个便捷函数
+
+import re
+import numpy as np
+import pandas as pd
+
+pd.set_option("display.max_columns", 200)
+pd.set_option("display.width", 180)
+
+def peek_csv(path, parse_dates=None, n=5):
+    """加载并快速总览一个 CSV。"""
+    df = pd.read_csv(path, parse_dates=parse_dates)
+    print(f"\n=== {path} ===")
+    print(f"shape = {df.shape}")
+    print("columns =", list(df.columns)[:50], "..." if df.shape[1] > 50 else "")
+    print("\nDtypes:\n", df.dtypes.head(30))
+    if 'VERSION_DATE' in df.columns:
+        try:
+            print("\nVERSION_DATE span:",
+                  pd.to_datetime(df['VERSION_DATE']).min(),
+                  "→",
+                  pd.to_datetime(df['VERSION_DATE']).max())
+        except Exception as e:
+            print("VERSION_DATE parse warning:", e)
+    print("\nNulls (top 15):\n", df.isna().sum().sort_values(ascending=False).head(15))
+    print("\nHead:\n", df.head(n))
+    return df
+
+
+⸻
+
+1) 查看 data/model_input_prep_for_training.csv
+
+model_input_path = "data/model_input_prep_for_training.csv"
+df_input = peek_csv(model_input_path, parse_dates=['VERSION_DATE'])
+
+# 关键分布与唯一性检查
+if {'CUST_SERIAL_NO','VERSION_DATE'}.issubset(df_input.columns):
+    print("\n# Unique customers:", df_input['CUST_SERIAL_NO'].nunique())
+    print("\n# Rows per VERSION_DATE:\n",
+          df_input['VERSION_DATE'].value_counts().sort_index())
+
+    dup_same_day = (df_input
+        .groupby(['VERSION_DATE','CUST_SERIAL_NO']).size()
+        .reset_index(name='rows').query('rows>1'))
+    print("\n# Customers having multiple rows on the SAME VERSION_DATE (top 10):")
+    print(dup_same_day.head(10))
+else:
+    print("\n[WARN] 缺少 CUST_SERIAL_NO 或 VERSION_DATE 列，无法做客户唯一性检查。")
+
+# 产品分布
+if 'PRODUCT_ID' in df_input.columns:
+    print("\n# PRODUCT_ID value_counts (top 20):\n",
+          df_input['PRODUCT_ID'].value_counts().head(20))
+
+# 数值型特征概览
+num_cols = df_input.select_dtypes(include='number').columns.tolist()
+print(f"\n# Numeric feature count = {len(num_cols)} (前 30):",
+      num_cols[:30])
+
+
+⸻
+
+2) 查看 data/product_features_prep_for_training.csv
+
+product_feat_path = "data/product_features_prep_for_training.csv"
+df_prod = peek_csv(product_feat_path)
+
+if 'PRODUCT_ID' in df_prod.columns:
+    print("\n# Unique PRODUCT_IDs:", df_prod['PRODUCT_ID'].nunique())
+    print("\n# PRODUCT_ID sample:\n", df_prod['PRODUCT_ID'].drop_duplicates().head(20))
+
+
+⸻
+
+3) 查看预测文件 output/3_REWARD_180925_predictions.csv
+
+这段会自动识别形如 top_1_arm_index / top_1_engagement_proba / top_1_weighted_sum 这样的列名，并整理成长表方便你后续“先按 VERSION_DATE，再按 CUST_SERIAL_NO 汇总成唯一 Top-K”。
+
+pred_path = "output/3_REWARD_180925_predictions.csv"
+df_pred = peek_csv(pred_path, parse_dates=['VERSION_DATE'])
+
+# 自动识别 top-k 列（形如 top_1_xxx / top-1-xxx 也可）
+top_cols = [c for c in df_pred.columns if re.match(r'^top[_-]?\d+_', c)]
+print("\n# Detected top-k columns (sample):", sorted(top_cols)[:12])
+
+# 把 wide 结构转换成长表 (customer-level 取 Top-K 会更方便)
+if top_cols:
+    mi = pd.Series(top_cols).str.extract(r'^top[_-]?(\d+)_(.+)$')
+    wide = df_pred[top_cols].copy()
+    wide.columns = pd.MultiIndex.from_arrays([mi[0].astype(int).to_list(), mi[1].to_list()],
+                                             names=['topk','field'])
+    # 拼回 id 列
+    id_cols = [c for c in ['CUST_SERIAL_NO','VERSION_DATE','PRODUCT_ID'] if c in df_pred.columns]
+    long = (pd.concat([df_pred[id_cols], wide], axis=1)
+              .set_index(id_cols)
+              .stack('topk')
+              .reset_index()
+              .rename(columns={'level_3':'topk'}))
+
+    print("\n# Long format preview (per row = 一个候选):")
+    print(long.head(10))
+
+    # 为后续“跨 campaign 合并后取 Top-K”准备一个通用打分列
+    score_col = None
+    for cand in ['weighted_sum','score','rank_score']:
+        if cand in long.columns:
+            score_col = cand; break
+    if score_col is None:
+        # 没有明确定义的 score，就用两柱概率加权（可改权重）
+        if {'engagement_proba','revenue_increment_proba'}.issubset(long.columns):
+            long['score'] = 0.5*long['engagement_proba'] + 0.5*long['revenue_increment_proba']
+            score_col = 'score'
+        else:
+            print("\n[INFO] 未发现 weighted_sum/score，也未找到两柱概率列，先跳过打分构造。")
+
+    # —— 关键步骤：先按 VERSION_DATE，再按 CUST_SERIAL_NO 做唯一 Top-K（把重复客户合并）——
+    if score_col and {'CUST_SERIAL_NO','VERSION_DATE'}.issubset(long.columns):
+        long_sorted = long.sort_values(['VERSION_DATE','CUST_SERIAL_NO', score_col],
+                                       ascending=[True, True, False])
+        topK = (long_sorted
+                .groupby(['VERSION_DATE','CUST_SERIAL_NO'])
+                .head(3)
+                .reset_index(drop=True))
+
+        print("\n# Customer-level unique Top-K after collapsing duplicates (preview):")
+        print(topK.head(10))
+
+        # 也可再聚合成一行 3 列（top1/top2/top3）的宽表：
+        # 注意：下面这块仅示例，如果每个候选有多字段，可先只保留 arm / score 再 pivot
+        cols_to_keep = ['topk', score_col]
+        arm_col = next((c for c in ['arm_index','arm','product_id','PRODUCT_ID'] if c in long.columns), None)
+        if arm_col:
+            cust_topk_wide = (topK[['VERSION_DATE','CUST_SERIAL_NO', arm_col] + cols_to_keep]
+                              .pivot_table(index=['VERSION_DATE','CUST_SERIAL_NO'],
+                                           columns='topk',
+                                           values=[arm_col, score_col],
+                                           aggfunc='first'))
+            cust_topk_wide.columns = [f"{a}_top{b}" for a,b in cust_topk_wide.columns]
+            cust_topk_wide = cust_topk_wide.reset_index()
+            print("\n# Customer-level Top1/Top2/Top3 wide format (preview):")
+            print(cust_topk_wide.head(5))
+        else:
+            print("\n[INFO] 未识别到候选中的 arm 列名（arm_index/arm/product_id/PRODUCT_ID），仅展示长表。")
+    else:
+        print("\n[INFO] 缺少 score 或键列（VERSION_DATE/CUST_SERIAL_NO），先不做合并 Top-K。")
+else:
+    print("\n[INFO] 预测文件中未检测到 top-k 结构的列。")
+
+
+⸻
+
+4) （可选）快速看一下模型 NPZ 的内容
+
+如果你也想确认 model_checkpoint/3_REWARD_180925.npz 里到底保存了哪些键/数组形状（有时是一个 dict，有时是按顺序的若干数组），用下面这段：
+
+import numpy as np
+model_npz = "model_checkpoint/3_REWARD_180925.npz"
+try:
+    z = np.load(model_npz, allow_pickle=True)
+    print("\n# NPZ keys:", list(z.keys()))
+    # 两种常见情况：
+    if len(z.files) == 1 and z.files[0].startswith('arr_'):
+        # 很可能是一个 dict 被整体保存
+        obj = z[z.files[0]].item()
+        print("# Detected dict-like payload. Keys:", list(obj.keys()))
+        for k, v in obj.items():
+            if isinstance(v, np.ndarray):
+                print(f"  - {k}: ndarray, shape={v.shape}, dtype={v.dtype}")
+            else:
+                print(f"  - {k}: {type(v)} ->", v)
+    else:
+        # 直接保存了多组数组
+        for k in z.files:
+            v = z[k]
+            if isinstance(v, np.ndarray):
+                print(f"  - {k}: ndarray, shape={v.shape}, dtype={v.dtype}")
+            else:
+                print(f"  - {k}: {type(v)} ->", v)
+except FileNotFoundError:
+    print(f"[WARN] {model_npz} not found.")
+
+
+⸻
+
+接下来怎么做？
+	•	先把这 4 段分别跑一下，把输出贴回（或确认是否与预期一致）。
+	•	我就能100%确定列名/结构，从而把“按 VERSION_DATE → CUST_SERIAL_NO 合并去重，再取 3n 里的 Top-3”的离线评估流程写成最终版（可直接接到你们 main_for_Karen_evaluation 的 Prediction 段后）。
+	•	随后我们再把“Diversity Benefit 的离线计算”落地到客户层（避免重复客户），并给出月度/分层的汇总与可视化版本。
