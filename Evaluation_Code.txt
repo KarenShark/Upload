@@ -1,59 +1,47 @@
-结论先说：
-	•	你这次的 4 个断言都没有触发，说明流程跑对了。
-	•	三个时间戳分别是 2024-10-31 / 2024-11-30 / 2024-12-31，正好是你们的 3-month offline observation 的每月月末切片；
-6,932 + 17,713 = 24,645；24,645 + 5,659 = 30,304，与之前的 “Unique customer-date 30304” 完全一致。✅
-	•	“Unique customer-date BEFORE/AFTER: 30304 / 30304” 的含义是：以 (VERSION_DATE, CUST_SERIAL_NO) 为键的唯一槽位数去重前后相同；这说明每个 customer-date 在宽表正好 1 行，去重成功。
-这不是“唯一个客数”。你打印的 unique customers across 3 months: 25036 才是 3 个月合并后的唯一个客数（小于 30304 很正常，因为一位客户可在 3 个月各出现一次）。
+# 数据摘要打印：customer-date 去重、唯一个客数等
+# 注：print 输出为英文；注释为中文
 
-⸻
+import pandas as pd
 
-为什么可以认定“无重复 + Top-K 合规”
+# 若 pred 尚未加载，请取消下一行注释并确保 pred_path 指向你的预测 CSV
+# pred = pd.read_csv(pred_path, parse_dates=['VERSION_DATE'])
 
-你已经检查了：
-	•	宽表 wide：wide.duplicated(['VERSION_DATE','CUST_SERIAL_NO']).sum()==0 → 一行一 customer-date。
-	•	明细 final_topk：
-	•	groupby(keys).size().max() <= 3 → 每个 customer-date 最多 3 条；
-	•	duplicated(keys+['candidate_product']).sum()==0 → 同一个 customer-date 内产品不重复。
-这三条足以保证customer-level（按月）无重复且 Top-K 都是 distinct。
+# 统一数据类型（稳妥起见）
+pred['CUST_SERIAL_NO'] = pred['CUST_SERIAL_NO'].astype(str)
+pred['VERSION_DATE'] = pd.to_datetime(pred['VERSION_DATE'])
 
-⸻
+# 1) 原始行数（campaign-level）
+raw_rows = len(pred)
 
-我建议再补两项“保险自检”（可直接粘贴跑）
-	1.	各月 Top-1/2/3 的覆盖率（确认是否出现空槽）
+# 2) 每月的 unique customer 数（即 customer-date 对的月度分布）
+by_month = pred.groupby('VERSION_DATE')['CUST_SERIAL_NO'].nunique().sort_index()
 
-for k in (1,2,3):
-    col = f"rec{k}_candidate_product" if f"rec{k}_candidate_product" in wide.columns else f"rec{k}_product"
-    cov = wide.assign(month=wide['VERSION_DATE'].dt.to_period('M')) \
-              .groupby('month')[col].apply(lambda s: s.notna().mean()).rename(f'top{k}_coverage')
-    print(cov)
+# 3) customer-date 总数（= 在三个月内去重后的 (VERSION_DATE, CUST_SERIAL_NO) 对数）
+unique_pairs_drop = pred.drop_duplicates(['VERSION_DATE', 'CUST_SERIAL_NO']).shape[0]
 
-	2.	宽表每行的 Top-K 互异性（双保险）
+# 也可用分月求和（做个一致性校验）
+unique_pairs_sum = int(by_month.sum())
 
-def distinct_ok(row):
-    vals = [row.get(f"rec{i}_candidate_product") for i in (1,2,3) if f"rec{i}_candidate_product" in row]
-    vals = [v for v in vals if pd.notna(v)]
-    return len(vals) == len(set(vals))
+# 4) 三个月合并后的唯一个客数（仅按 CUST_SERIAL_NO 去重）
+unique_customers = pred['CUST_SERIAL_NO'].nunique()
 
-print("row-level distinct ratio:", wide.apply(distinct_ok, axis=1).mean())
+# 5) 每位客户平均出现的月份数（辅助理解）
+avg_months_per_customer = unique_pairs_drop / unique_customers if unique_customers else float('nan')
 
-如果这两个检查结果都接近/等于 1.0，就可以把 customer_level_top3.csv 作为后续 diversity benefit 评估的稳定输入了。
+# ---- 打印结果（英文）----
+print("=== Offline Evaluation Summary (3-month window) ===")
+print(f"Raw rows (campaign-level): {raw_rows:,}")
 
-⸻
+print("\n# Unique customer-date pairs by month:")
+for d, n in by_month.items():
+    # 显示为 YYYY-MM-DD 以与你的数据一致
+    print(f"  {d.date()}: {int(n):,}")
 
-关于你屏幕里那条 SettingWithCopyWarning
+print(f"\nTotal unique customer-date pairs (drop-duplicates): {unique_pairs_drop:,}")
+print(f"Total unique customer-date pairs (sum of monthly): {unique_pairs_sum:,}")
 
-出现在给 rec_pos 赋值那一步。功能没错，但建议换成显式 .loc，避免隐患：
+# 一致性检查提示（非报错，仅提示）
+print(f"Consistency check (pairs equal by both methods): {unique_pairs_drop == unique_pairs_sum}")
 
-cands_dedup = cands.copy()
-cands_dedup.loc[:, 'rec_pos'] = cands_dedup.groupby(['VERSION_DATE','CUST_SERIAL_NO']).cumcount()+1
-
-
-⸻
-
-小结（这一步的状态）
-	•	时间窗口 ✔（正好 10/31、11/30、12/31）
-	•	customer-date 去重 ✔（30304→30304）
-	•	3 个月合并唯一个客数：25,036（合理）
-	•	Top-K 在 customer-date 内 distinct ✔
-
-你现在已经拥有无重复的 customer-level（按月）Top-3 数据，可以直接进入我们下一步的 Diversity Benefit 计算（基于这个宽表做个体层面的 uplift/潜在收益评估）。需要我就按这个输入把收益测算模板（方法 A/B/C）和可视化脚本补上。
+print(f"\nUnique customers across 3 months: {unique_customers:,}")
+print(f"Avg months per customer (pairs/customers): {avg_months_per_customer:.2f}")
