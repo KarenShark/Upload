@@ -1,17 +1,59 @@
-keys = ['VERSION_DATE','CUST_SERIAL_NO']
+结论先说：
+	•	你这次的 4 个断言都没有触发，说明流程跑对了。
+	•	三个时间戳分别是 2024-10-31 / 2024-11-30 / 2024-12-31，正好是你们的 3-month offline observation 的每月月末切片；
+6,932 + 17,713 = 24,645；24,645 + 5,659 = 30,304，与之前的 “Unique customer-date 30304” 完全一致。✅
+	•	“Unique customer-date BEFORE/AFTER: 30304 / 30304” 的含义是：以 (VERSION_DATE, CUST_SERIAL_NO) 为键的唯一槽位数去重前后相同；这说明每个 customer-date 在宽表正好 1 行，去重成功。
+这不是“唯一个客数”。你打印的 unique customers across 3 months: 25036 才是 3 个月合并后的唯一个客数（小于 30304 很正常，因为一位客户可在 3 个月各出现一次）。
 
-# 1) customer-date 唯一性（宽表）
-assert wide.duplicated(keys).sum() == 0
-assert wide.shape[0] == cands[keys].drop_duplicates().shape[0]
+⸻
 
-# 2) 明细表最多 3 条、且同一 customer-date 内产品不重复
-assert final_topk.groupby(keys).size().max() <= 3
-assert final_topk.duplicated(keys + ['candidate_product']).sum() == 0
+为什么可以认定“无重复 + Top-K 合规”
 
-# 3) 三个月是否覆盖对齐
-print('customer-date pairs by month:\n',
-      pred.groupby('VERSION_DATE')['CUST_SERIAL_NO'].nunique())
+你已经检查了：
+	•	宽表 wide：wide.duplicated(['VERSION_DATE','CUST_SERIAL_NO']).sum()==0 → 一行一 customer-date。
+	•	明细 final_topk：
+	•	groupby(keys).size().max() <= 3 → 每个 customer-date 最多 3 条；
+	•	duplicated(keys+['candidate_product']).sum()==0 → 同一个 customer-date 内产品不重复。
+这三条足以保证customer-level（按月）无重复且 Top-K 都是 distinct。
 
-# 4) 三个月合并后的“唯一个客数”（和 30304 不同的口径）
-print('unique customers across 3 months:',
-      pred['CUST_SERIAL_NO'].nunique())
+⸻
+
+我建议再补两项“保险自检”（可直接粘贴跑）
+	1.	各月 Top-1/2/3 的覆盖率（确认是否出现空槽）
+
+for k in (1,2,3):
+    col = f"rec{k}_candidate_product" if f"rec{k}_candidate_product" in wide.columns else f"rec{k}_product"
+    cov = wide.assign(month=wide['VERSION_DATE'].dt.to_period('M')) \
+              .groupby('month')[col].apply(lambda s: s.notna().mean()).rename(f'top{k}_coverage')
+    print(cov)
+
+	2.	宽表每行的 Top-K 互异性（双保险）
+
+def distinct_ok(row):
+    vals = [row.get(f"rec{i}_candidate_product") for i in (1,2,3) if f"rec{i}_candidate_product" in row]
+    vals = [v for v in vals if pd.notna(v)]
+    return len(vals) == len(set(vals))
+
+print("row-level distinct ratio:", wide.apply(distinct_ok, axis=1).mean())
+
+如果这两个检查结果都接近/等于 1.0，就可以把 customer_level_top3.csv 作为后续 diversity benefit 评估的稳定输入了。
+
+⸻
+
+关于你屏幕里那条 SettingWithCopyWarning
+
+出现在给 rec_pos 赋值那一步。功能没错，但建议换成显式 .loc，避免隐患：
+
+cands_dedup = cands.copy()
+cands_dedup.loc[:, 'rec_pos'] = cands_dedup.groupby(['VERSION_DATE','CUST_SERIAL_NO']).cumcount()+1
+
+
+⸻
+
+小结（这一步的状态）
+	•	时间窗口 ✔（正好 10/31、11/30、12/31）
+	•	customer-date 去重 ✔（30304→30304）
+	•	3 个月合并唯一个客数：25,036（合理）
+	•	Top-K 在 customer-date 内 distinct ✔
+
+你现在已经拥有无重复的 customer-level（按月）Top-3 数据，可以直接进入我们下一步的 Diversity Benefit 计算（基于这个宽表做个体层面的 uplift/潜在收益评估）。需要我就按这个输入把收益测算模板（方法 A/B/C）和可视化脚本补上。
