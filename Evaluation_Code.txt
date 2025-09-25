@@ -1,185 +1,212 @@
-# -*- coding: utf-8 -*-
-# ===== Sanity checks for diversity potential & benefit (print-only) =====
-import pandas as pd
-import numpy as np
+下面给你三块可直接粘到 notebook 的代码（全部自带健壮性检查与英文打印）。我统一假设你已经把上一节保存好的评估表读成了 eval_df（或你也可以用第一段里给的 read_csv 直接载入）。
+
+⸻
+
+1) 设运营阈值，计算 share_diversified（并做阈值灵敏度）
+
+# === Load (若你已有 eval_df 可跳过这三行) ===
+import pandas as pd, numpy as np
 from pathlib import Path
 
-# ---- 读取结果：若内存中已有 res，就用它；否则从 CSV 读取 ----
+model_name = "3_REWARD_180925"
+eval_path  = Path(f"output/{model_name}_customer_level_diversity_eval.csv")
+eval_df    = pd.read_csv(eval_path, parse_dates=['VERSION_DATE'])
+
+# 基本检查
+need_cols = ['VERSION_DATE','CUST_SERIAL_NO','readiness','benefit','diversity_score',
+             'baseline_prod','best_div_prod']
+missing = [c for c in need_cols if c not in eval_df.columns]
+assert not missing, f"Missing columns in eval_df: {missing}"
+
+# 统一月份列
+eval_df['month'] = eval_df['VERSION_DATE'].dt.to_period('M').astype(str)
+
+def threshold_sweep(df, readiness_thr=0.8, quantiles=(0.50, 0.75, 0.90), label_prefix="Q"):
+    """按若干 benefit 分位数阈值 + readiness 阈值，统计 share、uplift 等"""
+    pos = df['benefit'] > 0
+    qmap = df.loc[pos, 'benefit'].quantile(list(quantiles)).to_dict() if pos.any() else {}
+    rows = []
+
+    # 也加一个绝对阈值 0（只要收益>0 且 readiness 达标就多元化）
+    qmap = {**{f"{label_prefix}{int(q*100)}": thr for q, thr in qmap.items()},
+            "ABS>0": 0.0}
+
+    for name, thr in qmap.items():
+        mask = (df['readiness'] >= readiness_thr) & (df['benefit'] >= thr)
+        share = mask.mean()
+        cnt   = int(mask.sum())
+        rows_total = len(df)
+        mean_benefit_div = df.loc[mask, 'benefit'].mean() if cnt>0 else 0.0
+        total_uplift     = df.loc[mask, 'benefit'].sum()
+        mean_divscore    = df.loc[mask, 'diversity_score'].mean() if cnt>0 else 0.0
+
+        # 分月
+        by_m = (df.assign(_flag=mask)
+                  .groupby('month')
+                  .agg(rows=('CUST_SERIAL_NO','size'),
+                       share_diversified=('_flag','mean'),
+                       mean_benefit=('benefit', lambda x: x[mask.loc[x.index]].mean() if x.index.size else np.nan))
+                  .reset_index())
+
+        print(f"\n=== Threshold: readiness≥{readiness_thr}, benefit≥{name} (={thr:.2f}) ===")
+        print(f"rows: {rows_total:,} | diversified_cnt: {cnt:,} | share_diversified: {share:.3f}")
+        print(f"mean_benefit_if_diversified: {mean_benefit_div:.2f} | total_uplift: {total_uplift:,.2f} | mean_diversity_score: {mean_divscore:.3f}")
+        print("\nBy month:")
+        print(by_m.to_string(index=False))
+
+        rows.append({
+            'benefit_thr_name': name,
+            'benefit_thr': thr,
+            'readiness_thr': readiness_thr,
+            'rows': rows_total,
+            'div_cnt': cnt,
+            'share_diversified': share,
+            'mean_benefit_div': mean_benefit_div,
+            'total_uplift': total_uplift,
+            'mean_diversity_score': mean_divscore
+        })
+
+    return pd.DataFrame(rows).sort_values('benefit_thr')
+
+# 跑一版：readiness≥0.8，benefit 取 {p50, p75, p90, >0}
+summary_tbl = threshold_sweep(eval_df, readiness_thr=0.8, quantiles=(0.5, 0.75, 0.9))
+print("\n=== Threshold sensitivity summary ===")
+print(summary_tbl.to_string(index=False))
+
+解释：
+	•	你会同时得到总体 share / uplift 以及分月对比，便于运营定阈值（例如选 readiness≥0.8 & benefit≥Q75）。
+	•	最下方 summary_tbl 汇总了各阈值组合下的覆盖率与收益，可直接导出作决策表。
+
+⸻
+
+2) 画“产品替换矩阵”热力图（baseline → best_alt）
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 选择一个阈值组合来“定义多元化”
+READINESS_THR = 0.8
+# 选用上一步算出来的 p75；如未跑上一步，可换成常数例如 500
+benefit_thr = summary_tbl.loc[summary_tbl['benefit_thr_name']=="Q75",'benefit_thr'].max() \
+              if 'summary_tbl' in globals() else 500.0
+
+div_mask = (eval_df['readiness'] >= READINESS_THR) & (eval_df['benefit'] >= benefit_thr)
+
+# 生成替换计数表
+flows = (eval_df.loc[div_mask, ['baseline_prod','best_div_prod']]
+                  .groupby(['baseline_prod','best_div_prod'])
+                  .size()
+                  .unstack(fill_value=0))
+
+# 行列按总量排序
+flows = flows.loc[flows.sum(1).sort_values(ascending=False).index,
+                  flows.sum(0).sort_values(ascending=False).index]
+
+print("\nTop replacement flows (table):")
+print(flows.head(20).to_string())
+
+# 画热力图（matplotlib）
+fig, ax = plt.subplots(figsize=(8,6))
+im = ax.imshow(flows.values, aspect='auto')
+ax.set_xticks(np.arange(flows.shape[1])); ax.set_xticklabels(flows.columns, rotation=45, ha='right')
+ax.set_yticks(np.arange(flows.shape[0])); ax.set_yticklabels(flows.index)
+ax.set_title(f"Replacement heatmap (readiness≥{READINESS_THR}, benefit≥{benefit_thr:.0f})")
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="count")
+
+# 数字标注（可选）
+for i in range(flows.shape[0]):
+    for j in range(flows.shape[1]):
+        v = flows.values[i, j]
+        if v>0:
+            ax.text(j, i, str(v), ha='center', va='center', fontsize=8)
+
+plt.tight_layout()
+plt.show()
+
+解释：
+	•	这张热图非常适合跟业务讨论哪些 baseline 最常被替换成什么；行列已按总量排序，热点一眼能看出。
+
+⸻
+
+3) 加入 segment 与 engagement_proba，再跑分群/相关性
+
+import re
+
+# === 3.1 追加 segment（如文件存在） ===
 try:
-    _ = res  # noqa
-    df = res.copy()
-except NameError:
-    model_name = "3_REWARD_180925"  # ← 若不同，请改成你的模型名
-    path = Path(f"output/{model_name}_customer_level_diversity_eval.csv")
-    df = pd.read_csv(path, parse_dates=["VERSION_DATE"]) if path.exists() else None
-    if df is None:
-        raise FileNotFoundError(f"Cannot find file: {path}")
+    seg_map = pd.read_csv('output/customer_segment_map.csv')  # 需包含: CUST_SERIAL_NO, segment
+    assert {'CUST_SERIAL_NO','segment'}.issubset(seg_map.columns)
+    seg_map['CUST_SERIAL_NO'] = seg_map['CUST_SERIAL_NO'].astype(eval_df['CUST_SERIAL_NO'].dtype)
+    eval_df = eval_df.merge(seg_map[['CUST_SERIAL_NO','segment']], on='CUST_SERIAL_NO', how='left')
+    print("Segment column merged.")
+except Exception as e:
+    print(f"Segment map not found or invalid, skip segment analysis. Detail: {e}")
 
-# ---- 轻量清洗 ----
-if "VERSION_DATE" in df.columns and not np.issubdtype(df["VERSION_DATE"].dtype, np.datetime64):
-    # 若不是日期，就尽量解析
-    try:
-        df["VERSION_DATE"] = pd.to_datetime(df["VERSION_DATE"])
-    except Exception:
-        pass
+# === 3.2 识别 engagement 概率列 ===
+def find_eng_col(df):
+    cand = [c for c in df.columns
+            if re.search(r'(rec1|top1).*eng(agement)?(_)?proba', c, flags=re.I) or c.lower()=='eng_p1']
+    return cand[0] if cand else None
 
-for col in ["benefit", "readiness", "benefit_norm", "diversity_score"]:
-    if col not in df.columns:
-        raise KeyError(f"Missing column `{col}` in the evaluation dataframe.")
-
-N = len(df)
-div_mask = df["benefit"].fillna(0) > 0
-n_div = int(div_mask.sum())
-share_div = n_div / N if N > 0 else 0.0
-
-def _summ(series):
-    s = pd.Series(series).dropna()
-    if s.empty:
-        return {"count": 0}
-    q = s.quantile([.1,.25,.5,.75,.9,.95,.99])
-    return {
-        "count": int(s.size),
-        "mean": float(s.mean()),
-        "std": float(s.std(ddof=0)) if s.size > 1 else 0.0,
-        "min": float(s.min()),
-        "p10": float(q.loc[.1]),
-        "p25": float(q.loc[.25]),
-        "p50": float(q.loc[.5]),
-        "p75": float(q.loc[.75]),
-        "p90": float(q.loc[.9]),
-        "p95": float(q.loc[.95]),
-        "p99": float(q.loc[.99]),
-        "max": float(s.max()),
-    }
-
-print("\n================ OVERALL =================")
-print(f"Rows: {N:,}")
-print(f"Customers worth diversifying (benefit>0): {n_div:,}  ({share_div:,.2%})")
-
-b_all   = _summ(df["benefit"])
-b_pos   = _summ(df.loc[div_mask, "benefit"])
-score_s = _summ(df["diversity_score"])
-ready_s = _summ(df["readiness"])
-
-def _pretty(d, title):
-    if "count" not in d: 
-        print(f"{title}: N/A"); 
-        return
-    print(f"\n{title}")
-    keys = ["count","mean","std","min","p10","p25","p50","p75","p90","p95","p99","max"]
-    for k in keys:
-        if k in d:
-            val = d[k]
-            if isinstance(val, (int, np.integer)):
-                print(f"  {k:>4}: {val:,}")
-            else:
-                print(f"  {k:>4}: {val:,.4f}")
-
-_pretty(b_all,   "Benefit (all rows)")
-_pretty(b_pos,   "Benefit (only benefit>0)")
-_pretty(score_s, "Diversity score (0-1)")
-_pretty(ready_s, "Readiness (0-1)")
-
-# ---- 1) 每月对比：mean(benefit) / mean(diversity_score) / share(benefit>0) ----
-if "VERSION_DATE" in df.columns:
-    month = df["VERSION_DATE"]
-    try:
-        # 若为日期，按月 period；否则直接用原值
-        month = df["VERSION_DATE"].dt.to_period("M").astype(str)
-    except Exception:
-        month = df["VERSION_DATE"].astype(str)
-
-    monthly = (
-        df.assign(month=month)
-          .groupby("month")
-          .agg(
-              rows=("benefit","size"),
-              mean_benefit=("benefit","mean"),
-              median_benefit=("benefit","median"),
-              mean_diversity_score=("diversity_score","mean"),
-              mean_readiness=("readiness","mean"),
-              share_diversified=("benefit", lambda s: (s>0).mean()),
-          )
-          .reset_index()
-          .sort_values("month")
-    )
-    print("\n================ BY MONTH ================")
-    print(monthly.to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
-else:
-    print("\n[BY MONTH] `VERSION_DATE` not found; skipped.")
-
-# ---- 2) 被“替换”为何产品最多（只看 benefit>0 的行） ----
-print("\n============ PRODUCT REPLACEMENTS ==========")
-prod_base_col = "baseline_prod" if "baseline_prod" in df.columns else \
-                ("rec1_candidate_product" if "rec1_candidate_product" in df.columns else None)
-prod_alt_col  = "best_div_prod" if "best_div_prod" in df.columns else None
-
-if prod_base_col and prod_alt_col:
-    rep = (
-        df.loc[div_mask, [prod_base_col, prod_alt_col]]
-          .groupby([prod_base_col, prod_alt_col])
-          .size().reset_index(name="count")
-          .sort_values("count", ascending=False)
-    )
-    print("\nTop replacement flows (baseline -> best_alt):")
-    print(rep.head(15).to_string(index=False))
-
-    # 各 baseline 的“被替换率”
-    base_total = df.groupby(prod_base_col)["benefit"].size()
-    base_repl  = df.loc[div_mask].groupby(prod_base_col)["benefit"].size()
-    repl_rate  = (base_repl / base_total).fillna(0).reset_index(name="replacement_rate") \
-                .sort_values("replacement_rate", ascending=False)
-    print("\nReplacement rate by baseline product:")
-    print(repl_rate.to_string(index=False, float_format=lambda x: f"{x:,.2%}"))
-else:
-    print("Product columns not found; skipped product-level analysis.")
-
-# ---- 3) 分 segment（若有相关列） ----
-print("\n================ BY SEGMENT ===============")
-seg_candidates = ["CEM_SEGMENT","SEGMENT","segment","IND_DES2","SEG_DIV"]
-seg_col = next((c for c in seg_candidates if c in df.columns), None)
-if seg_col:
-    seg_tbl = (
-        df.groupby(seg_col)
-          .agg(
-              rows=("benefit","size"),
-              share_diversified=("benefit", lambda s: (s>0).mean()),
-              mean_benefit=("benefit","mean"),
-              mean_diversity_score=("diversity_score","mean")
-          ).reset_index()
-          .sort_values("mean_diversity_score", ascending=False)
-    )
-    print(f"\nSegment summary by `{seg_col}` (top 15 by mean_diversity_score):")
-    print(seg_tbl.head(15).to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
-else:
-    print("No segment column found; skipped segment analysis.")
-
-# ---- 4) 与 engagement 的关系（若有 rec1 的 engagement 概率） ----
-print("\n============= ENGAGEMENT RELATION ==========")
-eng_candidates = ["rec1_eng_proba","eng_p1","engagement_proba","top1_engagement_proba","p1_eng"]
-eng_col = next((c for c in eng_candidates if c in df.columns), None)
+eng_col = find_eng_col(eval_df)
+if eng_col is None:
+    # 兜底：若没有概率列，用 rec1_score 作为参与度 proxy
+    eng_col = 'rec1_score' if 'rec1_score' in eval_df.columns else None
 
 if eng_col:
-    # 分位分箱（避免重复边界导致报错）
-    try:
-        bins = pd.qcut(df[eng_col], q=10, duplicates="drop")
-    except Exception:
-        # 若值过少/常量，用等宽分箱
-        bins = pd.cut(df[eng_col], bins=10, include_lowest=True)
-    rel = (
-        df.assign(eng_bin=bins)
-          .groupby("eng_bin")
-          .agg(
-              rows=("benefit","size"),
-              mean_eng=(eng_col,"mean"),
-              share_diversified=("benefit", lambda s: (s>0).mean()),
-              mean_benefit=("benefit","mean"),
-              mean_diversity_score=("diversity_score","mean"),
-          )
-          .reset_index()
-          .sort_values("mean_eng")
-    )
-    print(f"\nRelationship vs engagement `{eng_col}` (binned):")
-    print(rel.to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
+    print(f"Using engagement column: {eng_col}")
 else:
-    print("No engagement-probability column found; skipped engagement relationship.")
+    print("No engagement column found; engagement relationship will be skipped.")
+
+# === 3.3 在选定运营阈值下，做分群/相关性 ===
+READINESS_THR = 0.8
+benefit_thr   = summary_tbl.loc[summary_tbl['benefit_thr_name']=="Q75",'benefit_thr'].max() \
+                if 'summary_tbl' in globals() else 500.0
+mask = (eval_df['readiness'] >= READINESS_THR) & (eval_df['benefit'] >= benefit_thr)
+eval_df = eval_df.assign(_diversified=mask)
+
+# --- 分 segment（若有） ---
+if 'segment' in eval_df.columns:
+    seg_view = (eval_df
+                .groupby('segment')
+                .agg(rows=('CUST_SERIAL_NO','size'),
+                     share_diversified=('_diversified','mean'),
+                     mean_benefit=('benefit','mean'),
+                     mean_diversity_score=('diversity_score','mean'))
+                .sort_values('share_diversified', ascending=False)
+                .reset_index())
+    print("\n=== Diversification by segment ===")
+    print(seg_view.to_string(index=False))
+else:
+    print("\nNo segment column; skipped segment breakdown.")
+
+# --- 与 engagement 的关系（若有） ---
+if eng_col:
+    # 分箱：10 等分
+    eval_df['_eng_bin'] = pd.qcut(eval_df[eng_col].rank(method='first'), q=10, labels=False)
+    eng_view = (eval_df
+                .groupby('_eng_bin')
+                .agg(rows=('CUST_SERIAL_NO','size'),
+                     mean_eng=(eng_col,'mean'),
+                     share_diversified=('_diversified','mean'),
+                     mean_benefit=('benefit','mean'),
+                     mean_readiness=('readiness','mean'))
+                .reset_index()
+                .sort_values('_eng_bin'))
+    print("\n=== Diversification vs. engagement deciles ===")
+    print(eng_view.to_string(index=False))
+else:
+    print("\nNo engagement-probability proxy found; skipped engagement relationship.")
+
+解释：
+	•	segment：输出每个客群的覆盖率/收益/多元化分值，帮助定位“多元化最有效”的客群。
+	•	engagement：按 10 分位画出参与度越高是否越适合多元化的证据（覆盖率/收益随分位上升应该更优）。
+
+⸻
+
+小结你要怎么用
+	•	先跑 Section 1 拿到 summary_tbl，和业务一起选一个运营阈值（推荐 readiness≥0.8 & benefit≥Q75 作为起点）。
+	•	用 Section 2 的热图对齐“哪些替换路径合理/需要加规则”。
+	•	用 Section 3 的分 segment 与 engagement 结果，确认在哪些客群先落地，并验证“高参与度→更适合多元化”的假设。
+
+需要把这些输出落盘（CSV/PNG）用于汇报，我也可以给你一键保存版本。
