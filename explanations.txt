@@ -1,54 +1,14 @@
-from IPython.display import display, Markdown, Math
+**Baseline 与最佳备选**
 
-# ---- 标题 & 直觉 ----
-display(Markdown("# Diversity Potential × Diversity Benefit (with Segment/Global Value Modeling)"))
+块级公式（推荐用 $$ 包起来）：
 
-display(Markdown("**Intuition（直觉）**  \n"
-"我们不为“多样化而多样化”。只有当： (1) 客户当期**可切换**（readiness 高），且 (2) "
-"换到另一个同样合理的候选能带来**可观的期望收益增量**（benefit 大），才认为这位客户值得多元化。"))
+$$
+V_{\text{base}}=\mathrm{EV}(\text{rec1}),\qquad
+V_{\text{alt}}^{*}=\max\{\mathrm{EV}(\text{rec2}),\ \mathrm{EV}(\text{rec3})\}
+$$
 
-# ---- 变量 ----
-display(Markdown("## Variables（当前实现）  \n"
-"- Top-K: `rec1_candidate_product`..`rec3_candidate_product`, `rec1_score`..`rec3_score`（0–1）。  \n"
-"- 训练窗（≤ 2024-09-30）里基于 **accepted 后的平均收益** 构建 `value(product | segment)`；"
-"样本不足或无 segment 时回退到全局 `value(product)`。"))
+其中 \( \mathrm{EV}(a)=p(a)\times \text{value}(a) \)。
 
-# ---- Baseline ----
-display(Markdown("## 1) Baseline Expected Value（基线期望价值）"))
-display(Math(r"V_{\text{base}} = \operatorname{EV}(\mathrm{rec}_1), \qquad \operatorname{EV}(a)=p(a)\cdot \text{value}(a)"))
 
-# ---- Best alternative & Benefit ----
-display(Markdown("## 2) Best Alternative & Raw Benefit（最佳备选与原始增益）"))
-display(Math(r"V_{\text{alt}}^\*=\max\{\operatorname{EV}(\mathrm{rec}_2),\,\operatorname{EV}(\mathrm{rec}_3)\}"))
-display(Math(r"B=\max\!\bigl(0,\ V_{\text{alt}}^\*-V_{\text{base}}\bigr)"))
-display(Markdown("> 把“多元化”直接与“能多赚多少”绑定，而非只看分布均匀性。"))
-
-# ---- Readiness ----
-display(Markdown("## 3) Readiness（可切换性）"))
-display(Math(r"p_k=\frac{s_k}{\sum_{j=1}^3 s_j},\quad \text{margin}=p_1-p_2,\quad H=-\sum_{k=1}^3 p_k\log p_k\big/\log 3"))
-display(Math(r"\text{readiness}=\sigma\!\left((1-\text{margin})+0.5\cdot H\right),\quad \sigma(x)=\frac{1}{1+e^{-x}}"))
-display(Markdown("**简化门控（可选）**：若暂时没有 engagement 概率，可用"))
-display(Math(r"\text{readiness}=0.5+0.5\cdot \texttt{rec1\_score}\in[0.5,1]"))
-display(Markdown("将来有 `engagement_proba` 直接替换即可。"))
-
-# ---- Normalized benefit ----
-display(Markdown("## 4) Normalized Benefit（归一化收益）"))
-display(Math(r"Q=\operatorname{p99}(B\mid B>0),\qquad b=\min\!\left(\frac{B}{Q},\,1\right)\in[0,1]"))
-
-# ---- Final scores ----
-display(Markdown("## Final Scores  \n"
-"- **Diversity benefit（金额）**:"))
-display(Math(r"\text{benefit}=B"))
-display(Markdown("- **Diversity potential（0–1）**:"))
-display(Math(r"\text{diversity\_score}=\text{readiness}\times b"))
-
-# ---- Segment vs Global ----
-display(Markdown("## Segment vs. Global  \n"
-"- 只影响 `value(product | segment)` → 进而影响 **benefit**；**readiness 与 segment 无关**。  \n"
-"- 有 segment：价值更贴近客群，benefit 更准确；无 segment：也可用（走全局均值），但个体差异刻画较弱。"))
-
-# ---- 价值参考的计算方式（附公式）----
-display(Markdown("## How value(product|segment) is computed（训练窗内）"))
-display(Math(r"\text{value}(a\mid \text{segment})=\mathbb{E}[\text{Rev}\mid \text{accepted}=1,\ \text{segment},\ a]"))
-display(Markdown("若样本量不足（如 n<50）回退到全局产品均值："))
-display(Math(r"\text{value}(a)=\mathbb{E}[\text{Rev}\mid \text{accepted}=1,\ a]"))
+行内示例：\( V_{\text{base}}=\mathrm{EV}(\text{rec1}) \)，
+\( V_{\text{alt}}^{*}=\max\{\mathrm{EV}(\text{rec2}),\ \mathrm{EV}(\text{rec3})\} \)。
