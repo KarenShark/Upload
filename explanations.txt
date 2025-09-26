@@ -1,44 +1,198 @@
+# ==========================================
+# Offline evaluation: Baseline = ground truth (Oct–Dec)
+# Lines: (A) cumulative Actual vs EV_top1/2/3
+#        (B) monthly mean benefit_top1/2/3 with baseline=0
+# ==========================================
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 
-# === Load ===
-df_in  = pd.read_csv('data/model_input_prep_for_training.csv', parse_dates=['VERSION_DATE'])
-pred   = pd.read_csv('output/3_REWARD_180925_customer_level_top3.csv', parse_dates=['VERSION_DATE'])
+# ---------- 读取数据 ----------
+pred = pd.read_csv('output/3_REWARD_180925_customer_level_top3.csv',
+                   parse_dates=['VERSION_DATE'])
+df   = pd.read_csv('data/model_input_prep_for_training.csv',
+                   parse_dates=['VERSION_DATE'])
 
-for c in ['CUST_SERIAL_NO']:
-    df_in[c]  = df_in[c].astype(str)
-    pred[c]   = pred[c].astype(str)
+# 统一主键类型
+pred['CUST_SERIAL_NO'] = pred['CUST_SERIAL_NO'].astype(str)
+df['CUST_SERIAL_NO']   = df['CUST_SERIAL_NO'].astype(str)
 
-print("\n=== BASIC DATE RANGES ===")
-print("model_input_prep_for_training.csv  :", df_in['VERSION_DATE'].min().date(), "->", df_in['VERSION_DATE'].max().date())
-print("customer_level_top3.csv (pred set):", pred['VERSION_DATE'].min().date(), "->", pred['VERSION_DATE'].max().date())
-print("pred months:", sorted(pred['VERSION_DATE'].dt.to_period('M').unique().astype(str)))
+# ---------- 标准化产品名（使 Top-K 与历史 SELLING_FINAL 可对齐） ----------
+def norm_prod_name(x):
+    if pd.isna(x): return np.nan
+    s = str(x).strip().lower()
+    s = s.replace(' ', '_').replace('-', '_').replace('/', '_')
+    return s
 
-# 你期望的训练截断（按你/师兄 notebook 的写法）
+if 'SELLING_FINAL' in df.columns:
+    df['prod_name'] = df['SELLING_FINAL'].apply(norm_prod_name)
+else:
+    df['prod_name'] = 'p_' + df['PRODUCT_ID'].astype(str)
+
+rec_name_cols = []
+for k in (1,2,3):
+    c = f"rec{k}_candidate_product" if f"rec{k}_candidate_product" in pred.columns else f"rec{k}_product"
+    rec_name_cols.append(c)
+    pred[c] = pred[c].apply(norm_prod_name)
+
+# ---------- segment 列（没有就用 global） ----------
+seg_col = 'CEM_SEGMENT' if 'CEM_SEGMENT' in df.columns else None
+if seg_col is None:
+    df['segment'] = 'global'
+else:
+    df['segment'] = df[seg_col].astype(str).fillna('unknown')
+
+# 把 segment 合并到预测宽表（按 customer-date 对齐）
+seg_first = (df[['VERSION_DATE','CUST_SERIAL_NO','segment']]
+             .drop_duplicates(subset=['VERSION_DATE','CUST_SERIAL_NO'], keep='first'))
+pred = pred.merge(seg_first, on=['VERSION_DATE','CUST_SERIAL_NO'], how='left')
+pred['segment'] = pred['segment'].fillna('global')
+
+# ---------- 训练窗口（≤ 2024-09-30）构造“接受后平均收益”参考 ----------
 train_cut = pd.Timestamp('2024-09-30')
-df_ref = df_in[df_in['VERSION_DATE'] <= train_cut]
+df_train  = df[df['VERSION_DATE'] <= train_cut].copy()
 
-print("\n=== REFERENCE/TRAIN WINDOW CHECK (≤ 2024-09-30) ===")
-print("ref date range:", df_ref['VERSION_DATE'].min().date(), "->", df_ref['VERSION_DATE'].max().date())
-print(df_ref['VERSION_DATE'].dt.to_period('M').value_counts().sort_index())
+acc_col = 'OVERALL_TRIGGER_RESPONSE'
+rev_col = 'TOTAL_REVENUE'
+assert acc_col in df_train.columns and rev_col in df_train.columns, \
+    "训练数据缺少 OVERALL_TRIGGER_RESPONSE 或 TOTAL_REVENUE"
 
-# 如果你之前以为是 Jan–Jul，也顺带数一下 Jan–Jul 的量
-jan_jul = (df_in['VERSION_DATE'] >= '2024-01-01') & (df_in['VERSION_DATE'] <= '2024-07-31')
-print("\nRows in Jan–Jul:", int(jan_jul.sum()))
+df_train['accepted'] = (df_train[acc_col].fillna(0) > 0).astype(int)
+df_train['revenue']  = pd.to_numeric(df_train[rev_col], errors='coerce').fillna(0.0)
+# winsorize 提升稳健性
+lo, hi = np.nanpercentile(df_train['revenue'], [1, 99])
+df_train['rev_w'] = df_train['revenue'].clip(lo, hi)
 
-# 评估月（pred 的 10–12 月）是否已有 ground truth
-need_cols = ['OVERALL_TRIGGER_RESPONSE','TOTAL_REVENUE']
-df_eval = df_in[df_in['VERSION_DATE'].isin(pred['VERSION_DATE'].unique())][['VERSION_DATE','CUST_SERIAL_NO'] + [c for c in need_cols if c in df_in.columns]].drop_duplicates()
-print("\n=== GROUND TRUTH AVAILABILITY ON EVAL MONTHS (Oct–Dec) ===")
-for c in need_cols:
-    if c in df_eval.columns:
-        nn = df_eval[c].notna().mean()
-        print(f"{c} non-null ratio:", f"{nn:.2%}")
-    else:
-        print(f"{c} not found in df_in")
+# segment × product 的价值参考
+g1 = df_train.groupby(['segment','prod_name'])
+ref_seg_prod = g1.agg(
+    n=('accepted','size'),
+    n_acc=('accepted','sum'),
+    p_acc=('accepted','mean'),
+    e_rev_accepted=('rev_w', lambda s: s[df_train.loc[s.index,'accepted']==1].mean())
+).reset_index()
 
-# 按月看实际收入的分布概览（确认“真有数”）
-if 'TOTAL_REVENUE' in df_eval.columns:
-    tmp = df_eval.groupby(df_eval['VERSION_DATE'].dt.to_period('M'))['TOTAL_REVENUE'].describe()[['count','mean','50%','75%','max']]
-    print("\nTOTAL_REVENUE by month (Oct–Dec):")
-    print(tmp)
+# 产品全局回退
+g2 = df_train.groupby('prod_name')
+ref_prod = g2.agg(
+    n=('accepted','size'),
+    n_acc=('accepted','sum'),
+    p_acc=('accepted','mean'),
+    e_rev_accepted=('rev_w', lambda s: s[df_train.loc[s.index,'accepted']==1].mean())
+).reset_index()
+
+MIN_N = 50
+ref_seg_prod = ref_seg_prod.merge(
+    ref_prod[['prod_name','e_rev_accepted']].rename(columns={'e_rev_accepted':'e_rev_accepted_prod'}),
+    on='prod_name', how='left'
+)
+ref_seg_prod['e_rev_accepted_final'] = np.where(
+    ref_seg_prod['n'] >= MIN_N,
+    ref_seg_prod['e_rev_accepted'],
+    ref_seg_prod['e_rev_accepted_prod']
+).fillna(0.0)
+
+def get_value(seg, prod):
+    r = ref_seg_prod[(ref_seg_prod['segment']==seg) & (ref_seg_prod['prod_name']==prod)]
+    if not r.empty:
+        return float(r['e_rev_accepted_final'].iloc[0])
+    r2 = ref_prod[ref_prod['prod_name']==prod]
+    return float(0.0 if r2.empty or pd.isna(r2['e_rev_accepted'].iloc[0]) else r2['e_rev_accepted'].iloc[0])
+
+# ---------- 评估窗口：Oct–Dec 的 ground truth ----------
+eval_mask = (pred['VERSION_DATE'] >= '2024-10-01') & (pred['VERSION_DATE'] <= '2024-12-31')
+
+# 将真实收入并到宽表（防止 customer-date 不齐致）
+gt = (df[['VERSION_DATE','CUST_SERIAL_NO',acc_col,rev_col]]
+      .drop_duplicates(subset=['VERSION_DATE','CUST_SERIAL_NO'], keep='first'))
+pred = pred.merge(gt, on=['VERSION_DATE','CUST_SERIAL_NO'], how='left')
+
+# 只保留 10–12 月有 ground truth 的样本
+mask_gt = eval_mask & pred[rev_col].notna()
+eval_df = pred.loc[mask_gt].copy()
+
+# ---------- 若缺少 *_eng_proba，用 score 映射到 [0,1] 的占位 ----------
+for k in (1,2,3):
+    pcol = f"rec{k}_eng_proba"
+    scol = f"rec{k}_score"
+    if pcol not in eval_df.columns:
+        if scol in eval_df.columns:
+            s  = eval_df[scol].astype(float)
+            lo,hi = np.nanpercentile(s,[1,99])
+            eval_df[pcol] = np.clip((s-lo)/(hi-lo+1e-8),0,1)
+        else:
+            eval_df[pcol] = np.nan
+
+# ---------- 逐行计算 EV_top1/2/3、baseline actual、benefit ----------
+def row_evs(r):
+    seg = r.get('segment','global')
+    out = {}
+    # baseline = ground truth actual revenue
+    out['actual'] = float(r[rev_col]) if pd.notna(r[rev_col]) else 0.0
+    for k in (1,2,3):
+        ncol = f"rec{k}_candidate_product" if f"rec{k}_candidate_product" in r.index else f"rec{k}_product"
+        pcol = f"rec{k}_eng_proba"
+        prod = r.get(ncol, np.nan)
+        p    = r.get(pcol, np.nan)
+        if pd.notna(prod) and pd.notna(p):
+            val = get_value(seg, prod)
+            out[f'ev{k}'] = float(p) * float(val)
+        else:
+            out[f'ev{k}'] = np.nan
+    for k in (1,2,3):
+        out[f'benefit{k}'] = out[f'ev{k}'] - out['actual'] if pd.notna(out[f'ev{k}']) else np.nan
+    return pd.Series(out)
+
+evs = eval_df.apply(row_evs, axis=1)
+eval_df = pd.concat([eval_df[['VERSION_DATE']], evs], axis=1)
+eval_df['month'] = eval_df['VERSION_DATE'].dt.to_period('M').astype(str)
+
+# ---------- 月度聚合：均值与累计 ----------
+grp = eval_df.groupby('month', sort=True).agg(
+    mean_actual=('actual','mean'),
+    mean_ev1=('ev1','mean'),
+    mean_ev2=('ev2','mean'),
+    mean_ev3=('ev3','mean'),
+    mean_benefit1=('benefit1','mean'),
+    mean_benefit2=('benefit2','mean'),
+    mean_benefit3=('benefit3','mean'),
+    n=('actual','size')
+).reset_index()
+
+# 累计（按月份排序）
+grp = grp.sort_values('month').reset_index(drop=True)
+for col in ['mean_actual','mean_ev1','mean_ev2','mean_ev3']:
+    grp[f'cum_{col}'] = grp[col].cumsum()
+
+print("=== Date windows check ===")
+print("Train value reference: <= 2024-09-30 (confirmed).")
+print("Eval months (with ground truth):", grp['month'].tolist())
+print("\nMonthly means (head):\n", grp[['month','mean_actual','mean_ev1','mean_ev2','mean_ev3','n']])
+
+# ---------- 画图 A：累计 Actual vs EV_top1/2/3 ----------
+plt.figure(figsize=(8,5))
+plt.plot(grp['month'], grp['cum_mean_actual'], label='Cumulative Actual (baseline)')
+plt.plot(grp['month'], grp['cum_mean_ev1'], label='Cumulative EV Top-1')
+plt.plot(grp['month'], grp['cum_mean_ev2'], label='Cumulative EV Top-2')
+plt.plot(grp['month'], grp['cum_mean_ev3'], label='Cumulative EV Top-3')
+plt.title('Cumulative Actual vs Model Expected Revenue (Oct–Dec)')
+plt.xlabel('Month')
+plt.ylabel('Cumulative mean revenue')
+plt.legend()
+plt.xticks(rotation=0)
+plt.tight_layout()
+plt.show()
+
+# ---------- 画图 B：月度平均 benefit（baseline=0 轴） ----------
+plt.figure(figsize=(8,5))
+plt.axhline(0.0, linestyle='--', linewidth=1, label='Baseline (Actual)')
+plt.plot(grp['month'], grp['mean_benefit1'], label='Benefit Top-1')
+plt.plot(grp['month'], grp['mean_benefit2'], label='Benefit Top-2')
+plt.plot(grp['month'], grp['mean_benefit3'], label='Benefit Top-3')
+plt.title('Monthly Mean Benefit vs Baseline (Actual) (Oct–Dec)')
+plt.xlabel('Month')
+plt.ylabel('Mean benefit (EV_k - Actual)')
+plt.legend()
+plt.xticks(rotation=0)
+plt.tight_layout()
+plt.show()
