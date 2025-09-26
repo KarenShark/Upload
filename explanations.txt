@@ -1,14 +1,44 @@
-**Baseline 与最佳备选**
+import pandas as pd
+import numpy as np
 
-块级公式（推荐用 $$ 包起来）：
+# === Load ===
+df_in  = pd.read_csv('data/model_input_prep_for_training.csv', parse_dates=['VERSION_DATE'])
+pred   = pd.read_csv('output/3_REWARD_180925_customer_level_top3.csv', parse_dates=['VERSION_DATE'])
 
-$$
-V_{\text{base}}=\mathrm{EV}(\text{rec1}),\qquad
-V_{\text{alt}}^{*}=\max\{\mathrm{EV}(\text{rec2}),\ \mathrm{EV}(\text{rec3})\}
-$$
+for c in ['CUST_SERIAL_NO']:
+    df_in[c]  = df_in[c].astype(str)
+    pred[c]   = pred[c].astype(str)
 
-其中 \( \mathrm{EV}(a)=p(a)\times \text{value}(a) \)。
+print("\n=== BASIC DATE RANGES ===")
+print("model_input_prep_for_training.csv  :", df_in['VERSION_DATE'].min().date(), "->", df_in['VERSION_DATE'].max().date())
+print("customer_level_top3.csv (pred set):", pred['VERSION_DATE'].min().date(), "->", pred['VERSION_DATE'].max().date())
+print("pred months:", sorted(pred['VERSION_DATE'].dt.to_period('M').unique().astype(str)))
 
+# 你期望的训练截断（按你/师兄 notebook 的写法）
+train_cut = pd.Timestamp('2024-09-30')
+df_ref = df_in[df_in['VERSION_DATE'] <= train_cut]
 
-行内示例：\( V_{\text{base}}=\mathrm{EV}(\text{rec1}) \)，
-\( V_{\text{alt}}^{*}=\max\{\mathrm{EV}(\text{rec2}),\ \mathrm{EV}(\text{rec3})\} \)。
+print("\n=== REFERENCE/TRAIN WINDOW CHECK (≤ 2024-09-30) ===")
+print("ref date range:", df_ref['VERSION_DATE'].min().date(), "->", df_ref['VERSION_DATE'].max().date())
+print(df_ref['VERSION_DATE'].dt.to_period('M').value_counts().sort_index())
+
+# 如果你之前以为是 Jan–Jul，也顺带数一下 Jan–Jul 的量
+jan_jul = (df_in['VERSION_DATE'] >= '2024-01-01') & (df_in['VERSION_DATE'] <= '2024-07-31')
+print("\nRows in Jan–Jul:", int(jan_jul.sum()))
+
+# 评估月（pred 的 10–12 月）是否已有 ground truth
+need_cols = ['OVERALL_TRIGGER_RESPONSE','TOTAL_REVENUE']
+df_eval = df_in[df_in['VERSION_DATE'].isin(pred['VERSION_DATE'].unique())][['VERSION_DATE','CUST_SERIAL_NO'] + [c for c in need_cols if c in df_in.columns]].drop_duplicates()
+print("\n=== GROUND TRUTH AVAILABILITY ON EVAL MONTHS (Oct–Dec) ===")
+for c in need_cols:
+    if c in df_eval.columns:
+        nn = df_eval[c].notna().mean()
+        print(f"{c} non-null ratio:", f"{nn:.2%}")
+    else:
+        print(f"{c} not found in df_in")
+
+# 按月看实际收入的分布概览（确认“真有数”）
+if 'TOTAL_REVENUE' in df_eval.columns:
+    tmp = df_eval.groupby(df_eval['VERSION_DATE'].dt.to_period('M'))['TOTAL_REVENUE'].describe()[['count','mean','50%','75%','max']]
+    print("\nTOTAL_REVENUE by month (Oct–Dec):")
+    print(tmp)
